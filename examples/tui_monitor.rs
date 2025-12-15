@@ -1,19 +1,67 @@
-use std::{io, sync::{Arc, Mutex}, time::Duration};
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+use std::{fmt::format, io, sync::{Arc, Mutex}, time::Duration};
+use crossterm::{event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}
 };
 use ratatui::{prelude::*, widgets::*};
 use tokio::sync::mpsc;
 
-// Import your SDK
 use forge_sdk::KrakenClient;
-use forge_sdk::model::message::KrakenMessage;
+use forge_sdk::model::message::{KrakenMessage, BookMessage, BookData, BookLevel};
 use forge_sdk::book::orderbook::LocalBook;
 use forge_sdk::book::checksum::validate_checksum;
+use regex::Regex;
 
-// --- STATE MANAGEMENT ---
+fn manually_parse_book_message(json: &str) -> Result<KrakenMessage, serde_json::Error> {
+    let channel_re = Regex::new(r#""channel":"([^"]+)""#).unwrap();
+    let type_re = Regex::new(r#""type":"([^"]+)""#).unwrap();
+    let symbol_re = Regex::new(r#""symbol":"([^"]+)""#).unwrap();
+    let checksum_re = Regex::new(r#""checksum":(\d+)"#).unwrap();
+    
+    let channel = channel_re.captures(json).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let type_str = type_re.captures(json).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let symbol = symbol_re.captures(json).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let checksum: u32 = checksum_re.captures(json).and_then(|c| c.get(1)).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    
+    let bids = extract_price_qty_array_from_raw(json, "bids");
+    let asks = extract_price_qty_array_from_raw(json, "asks");
+    
+    let book_data = BookData {
+        symbol,
+        checksum,
+        bids,
+        asks,
+    };
+    
+    let book_msg = BookMessage {
+        channel,
+        r#type: type_str,
+        data: vec![book_data],
+    };
+    
+    Ok(KrakenMessage::Book(book_msg))
+}
+
+fn extract_price_qty_array_from_raw(json: &str, field_name: &str) -> Vec<BookLevel> {
+    let array_pattern = format!(r#""{}":\[(.*?)\]"#, field_name);
+    let array_re = Regex::new(&array_pattern).unwrap();
+    
+    let array_content = array_re.captures(json)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+        .unwrap_or("");
+    
+    let obj_re = Regex::new(r#"\{"price":([\d.]+),"qty":([\d.]+)\}"#).unwrap();
+    
+    obj_re.captures_iter(array_content)
+        .map(|cap| {
+            let price = cap.get(1).unwrap().as_str().to_string();
+            let qty = cap.get(2).unwrap().as_str().to_string();
+            BookLevel { price, qty }
+        })
+        .collect()
+}
+
 struct AppState {
     pub book: LocalBook,
     pub logs: Vec<String>,
@@ -21,11 +69,11 @@ struct AppState {
     pub last_checksum: u32,
 }
 
-impl AppState {
+impl AppState{
     fn new() -> Self {
         Self {
             book: LocalBook::new(),
-            logs: vec!["Initializing Kraken Forge...".to_string()],
+            logs: vec!["Initializing Kraken ...".to_string()],
             checksum_valid: true,
             last_checksum: 0,
         }
@@ -39,32 +87,26 @@ impl AppState {
     }
 }
 
-// --- MAIN ENTRY ---
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Setup Crypto Provider
     rustls::crypto::ring::default_provider().install_default().ok();
 
-    // 2. Setup Terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // 3. Shared State
     let app_state = Arc::new(Mutex::new(AppState::new()));
 
-    // 4. SPAWN BACKGROUND NETWORK TASK
     let state_clone = app_state.clone();
     tokio::spawn(async move {
         run_network_loop(state_clone).await;
     });
 
-    // 5. RUN UI LOOP (Main Thread)
     let res = run_ui_loop(&mut terminal, app_state);
 
-    // 6. Cleanup
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -76,85 +118,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(err) = res {
         println!("{:?}", err)
     }
-
     Ok(())
 }
 
-// --- THE NETWORK ENGINE ---
 async fn run_network_loop(state: Arc<Mutex<AppState>>) {
     let mut client = match KrakenClient::connect("wss://ws.kraken.com/v2").await {
         Ok(c) => c,
         Err(e) => {
-            state.lock().unwrap().log(format!("Connection Error: {}", e));
-            return;
+            state.lock().unwrap().log(format!("Connection Error: {}" , e));
+            return ;
         }
     };
 
-    // Subscribe to Book and Trade
     let _ = client.subscribe_book(&["BTC/USD"], 10).await;
-    
-    // Manual Trade Sub command
+
     let trade_cmd = r#"{"method":"subscribe", "params":{"channel":"trade", "symbol":["BTC/USD"]}}"#.to_string();
     let _ = client.send_command(trade_cmd).await;
 
     let mut stream = client.stream();
-    state.lock().unwrap().log("✅ Connected & Subscribed.".to_string());
+    state.lock().unwrap().log("Connected & Subscribed.".to_string());
 
-    while let Some(msg_res) = stream.recv().await {
+    while let Some(msg_res)  = stream.recv().await {
         if let Ok(txt) = msg_res {
-            // NOTE: Using serde_json directly here. If you kept the regex hack, insert it here.
-            if let Ok(parsed) = serde_json::from_str::<KrakenMessage>(&txt) {
+            let parsed = if txt.contains("\"channel\":\"book\"") {
+                manually_parse_book_message(&txt)
+            } else {
+                serde_json::from_str::<KrakenMessage>(&txt)
+            };
+            
+            if let Ok(parsed) = parsed {
                 let mut s = state.lock().unwrap();
-                
-                match parsed {
-                    KrakenMessage::Book(msg) => {
-                        let data = &msg.data[0];
-                        if msg.r#type == "snapshot" {
-                            s.book.apply_snapshot(data.bids.clone(), data.asks.clone());
-                            s.log("📸 Snapshot Loaded".to_string());
-                        } else {
-                            s.book.apply_updates(data.bids.clone(), true);
-                            s.book.apply_updates(data.asks.clone(), false);
-                        }
 
-                        // Checksum Logic
-                        s.checksum_valid = validate_checksum(&s.book, data.checksum);
-                        s.last_checksum = data.checksum;
-                        if !s.checksum_valid {
-                            s.log(format!("❌ Checksum Mismatch! RPC: {}", data.checksum));
-                        }
-                    }
-                    KrakenMessage::Trade(msg) => {
-                        for t in msg.data {
-                            let val = t.price * t.qty;
-                            // Whale Alert Logic > $50k
-                            if val > 50_000.0 {
-                                s.log(format!("🚨 WHALE ALERT: {} sold {:.4} BTC (${:.0})", 
-                                    t.side.to_uppercase(), t.qty, val));
-                            } else if val > 10_000.0 {
-                                // Log medium trades
-                                s.log(format!("💰 Trade: {} ${:.0}", t.side, t.price));
+                    match parsed {
+                        KrakenMessage::Book(msg) => {
+                            let data = &msg.data[0];
+                            if msg.r#type == "snapshot" {
+                                s.book.apply_snapshot(data.bids.clone(), data.asks.clone());
+                                s.log("📸 Snapshot Loaded".to_string());
+                            } else {
+                                s.book.apply_updates(data.bids.clone(), true);
+                                s.book.apply_updates(data.asks.clone(), false);
+                            }
+    
+                            // Checksum Logic
+                            s.checksum_valid = validate_checksum(&s.book, data.checksum);
+                            s.last_checksum = data.checksum;
+                            if !s.checksum_valid {
+                                s.log(format!("❌ Checksum Mismatch! RPC: {}", data.checksum));
                             }
                         }
+                        KrakenMessage::Trade(msg) => {
+                            for t in msg.data {
+                                let val = t.price * t.qty;
+                                // Whale Alert Logic > $50k
+                                if val > 50_000.0 {
+                                    s.log(format!("🚨 WHALE ALERT: {} sold {:.4} BTC (${:.0})", 
+                                        t.side.to_uppercase(), t.qty, val));
+                                } else if val > 10_000.0 {
+                                    // Log medium trades
+                                    s.log(format!("💰 Trade: {} ${:.0}", t.side, t.price));
+                                }
+                            }
+                        }
+                        KrakenMessage::Heartbeat { .. } => {}
+                        _=> {}
                     }
-                    KrakenMessage::Heartbeat { .. } => {} // Ignore
-                    _ => {} 
-                }
             }
         }
     }
 }
 
-// --- THE UI RENDER LOOP ---
 fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: Arc<Mutex<AppState>>,
 ) -> io::Result<()> {
     loop {
-        // Draw
         terminal.draw(|f| ui(f, &state))?;
 
-        // Handle Input (Poll fast for responsiveness)
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if let KeyCode::Char('q') = key.code {
@@ -165,7 +205,6 @@ fn run_ui_loop(
     }
 }
 
-// --- DRAWING THE WIDGETS ---
 fn ui(f: &mut Frame, state: &Arc<Mutex<AppState>>) {
     let s = state.lock().unwrap();
 
