@@ -16,6 +16,7 @@ pub struct ConnectionManager {
     url: Url,
     event_sender: mpsc::Sender<Result<String, KrakenError>>,
     command_receiver: mpsc::Receiver<String>,
+    active_subscriptions: Vec<String>,
 }
 
 impl ConnectionManager {
@@ -28,6 +29,7 @@ impl ConnectionManager {
             url: Url::parse(url)?,
             event_sender,
             command_receiver,
+            active_subscriptions: Vec::new(),
         })
     }
 
@@ -46,6 +48,15 @@ impl ConnectionManager {
 
                 let (mut write, mut read) = ws_stream.split();
 
+                // If we have history, replay it immediately upon connection
+                if !self.active_subscriptions.is_empty() {
+                    info!("Resubscribing to {} active channels...", self.active_subscriptions.len());
+                    for cmd in &self.active_subscriptions {
+                        if let Err(e) = write.send(Message::Text(cmd.clone().into())).await {
+                            error!("Failed to resubscribe: {}" , e);
+                        }
+                    }
+                }
                 loop {
                     tokio::select! {
                         msg = read.next() => {

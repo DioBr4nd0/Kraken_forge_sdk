@@ -68,4 +68,8 @@ impl KrakenClient {
     pub fn stream(&mut self) -> mpsc::Receiver<Result<String, KrakenError>> {
         self.event_receiver.take().expect("Stream already taken!")
     }
+
+    pub async fn send_raw(&self, json:String) -> Result<(), KrakenError> {
+        self.command_sender.send(json).await.map_err(|_| KrakenError::ChannelClosed)
+    }
 }

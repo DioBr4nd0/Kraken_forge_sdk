@@ -79,7 +79,7 @@ async fn main() {
 
     let mut book = LocalBook::new();
 
-    println!("Waiting for Book Data...");
+println!("Waiting for Book Data...");
 
 while let Some(msg_res) = rx_user_event.recv().await {
     match msg_res {
