@@ -14,7 +14,7 @@ use std::{
     collections::HashMap,
     io,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use once_cell::sync::Lazy;
 
@@ -78,12 +78,11 @@ fn manually_parse_book_message(json: &str) -> Result<KrakenMessage, serde_json::
     Ok(KrakenMessage::Book(book_msg))
 }
 
-/// Extract price/quantity array using pre-compiled static regex
+/// Extract price/quantity array using memchr for O(1) compilation + fast search
 fn extract_price_qty_array_from_raw(json: &str, field_name: &str) -> Vec<BookLevel> {
     let pattern = format!("\"{}\":[", field_name);
     let bytes = json.as_bytes();
     
-    // Use Boyer-Moore string search (faster than regex for literal strings)
     let finder = memmem::Finder::new(pattern.as_bytes());
     
     let start = match finder.find(bytes) {
@@ -91,7 +90,6 @@ fn extract_price_qty_array_from_raw(json: &str, field_name: &str) -> Vec<BookLev
         None => return vec![],
     };
     
-    // Find matching closing bracket
     let mut depth = 0;
     let mut end = start;
     for i in start..bytes.len() {
@@ -110,7 +108,6 @@ fn extract_price_qty_array_from_raw(json: &str, field_name: &str) -> Vec<BookLev
     
     let array_content = &json[start..end];
     
-    // Now parse individual entries
     BOOK_LEVEL_RE
         .captures_iter(array_content)
         .map(|cap| BookLevel {
@@ -137,6 +134,30 @@ struct AppState {
     pub pairs: Vec<String>,
     pub frozen_view: Option<LocalBook>,
     pub depth: usize,
+    pub metrics: Metrics,
+}
+
+struct Metrics {
+    pub total_messages: u64,
+    pub start_time: Instant,
+    pub mps: u64,
+    pub last_second_count: u64,
+    pub last_tick: Instant,  // ✅ FIXED: Changed from u64 to Instant
+    pub processing_latency: Duration,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            total_messages: 0,
+            start_time: now,
+            mps: 0,
+            last_second_count: 0,
+            last_tick: now,  // ✅ Initialize with Instant
+            processing_latency: Duration::from_micros(0),
+        }
+    }
 }
 
 impl AppState {
@@ -150,6 +171,7 @@ impl AppState {
             pairs: TRADING_PAIRS.iter().map(|s| s.to_string()).collect(),
             frozen_view: None,
             depth: ORDERBOOK_DEPTH,
+            metrics: Metrics::new(),
         }
     }
 
@@ -222,7 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// --- NETWORK LOOP WITH SELF-HEALING ---
+// --- NETWORK LOOP WITH METRICS & SELF-HEALING ---
 async fn run_network_loop(state: Arc<Mutex<AppState>>) {
     let mut client = match KrakenClient::connect("wss://ws.kraken.com/v2").await {
         Ok(c) => c,
@@ -245,6 +267,10 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
 
     while let Some(msg_res) = stream.recv().await {
         if let Ok(txt) = msg_res {
+            // ⏱️ START PERFORMANCE TRACKING
+            let start_process = Instant::now();
+
+            // Parse message
             let parsed = if txt.contains("\"channel\":\"book\"") {
                 manually_parse_book_message(&txt)
             } else {
@@ -256,7 +282,21 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
 
                 {
                     let mut s = state.lock().unwrap();
+                    
+                    // 📊 UPDATE MESSAGE COUNTER
+                    s.metrics.total_messages += 1;
 
+                    // 🚀 CALCULATE MESSAGES PER SECOND (MPS)
+                    if start_process.duration_since(s.metrics.last_tick).as_secs() >= 1 {
+                        let current = s.metrics.total_messages;
+                        let previous = s.metrics.last_second_count;
+                        
+                        s.metrics.mps = current - previous;
+                        s.metrics.last_second_count = current;
+                        s.metrics.last_tick = start_process;
+                    }
+
+                    // Process message types
                     match parsed {
                         KrakenMessage::Book(msg) => {
                             should_recover = handle_book_message(&mut s, msg);
@@ -267,6 +307,10 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                         KrakenMessage::Heartbeat { .. } => {}
                         _ => {}
                     }
+
+                    // ⚡ MEASURE PROCESSING LATENCY
+                    let elapsed = start_process.elapsed();
+                    s.metrics.processing_latency = elapsed;
                 }
 
                 if should_recover {
@@ -322,7 +366,7 @@ fn handle_book_message(state: &mut AppState, msg: BookMessage) -> bool {
             if let Some(book) = state.books.get_mut(sym) {
                 *book = LocalBook::new();
             }
-            return true; // Trigger recovery
+            return true;
         }
     }
 
@@ -516,27 +560,25 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
-    let (status_text, status_style) = match state.status {
-        SyncStatus::Healthy => (
-            format!("Checksum Status: ✅ VALID | Last RPC: {}", state.last_checksum),
-            Style::default().fg(Color::Green),
-        ),
-        SyncStatus::ChecksumFail => (
-            format!(
-                "Checksum Status: ❌ FAILURE | Last RPC: {}",
-                state.last_checksum
-            ),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        SyncStatus::Recovering => (
-            "Checksum Status: ⚠️ RECOVERING (Resyncing)...".to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::RAPID_BLINK),
-        ),
+    let uptime_secs = state.metrics.start_time.elapsed().as_secs();
+    let latency_micros = state.metrics.processing_latency.as_micros();
+    
+    let (status_indicator, status_style) = match state.status {
+        SyncStatus::Healthy => ("✅", Style::default().fg(Color::Green)),
+        SyncStatus::ChecksumFail => ("❌", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        SyncStatus::Recovering => ("⚠️", Style::default().fg(Color::Yellow).add_modifier(Modifier::RAPID_BLINK)),
     };
 
-    let footer = Paragraph::new(status_text)
+    let footer_text = format!(
+        " {} | 🚀 {} msg/s | ⚡ {}µs | 📊 {} msgs | ⏱️ {}s ",
+        status_indicator,
+        state.metrics.mps,
+        latency_micros,
+        state.metrics.total_messages,
+        uptime_secs
+    );
+
+    let footer = Paragraph::new(footer_text)
         .style(status_style)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, area);
