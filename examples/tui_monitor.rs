@@ -10,12 +10,12 @@ use forge_sdk::model::message::{BookData, BookLevel, BookMessage, KrakenMessage}
 use ratatui::{prelude::*, widgets::*};
 use regex::Regex;
 use std::{
+    collections::HashMap,
     io,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-// --- YOUR EXISTING PARSER LOGIC (KEPT INTACT) ---
 fn manually_parse_book_message(json: &str) -> Result<KrakenMessage, serde_json::Error> {
     let channel_re = Regex::new(r#""channel":"([^"]+)""#).unwrap();
     let type_re = Regex::new(r#""type":"([^"]+)""#).unwrap();
@@ -66,7 +66,7 @@ fn extract_price_qty_array_from_raw(json: &str, field_name: &str) -> Vec<BookLev
     let array_pattern = format!(r#""{}":\[(.*?)\]"#, field_name);
     let array_re = Regex::new(&array_pattern).unwrap();
 
-    let array_content = array_re
+    let array_content = array_re    
         .captures(json)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str())
@@ -93,19 +93,31 @@ enum SyncStatus {
 }
 
 struct AppState {
-    pub book: LocalBook,
+    pub books: HashMap<String, LocalBook>,
     pub logs: Vec<String>,
     pub status: SyncStatus, // Replaced simple boolean with Enum
     pub last_checksum: u32,
+    pub curr_index: usize,
+    pub pairs: Vec<String>,
+    pub frozen_view: Option<LocalBook>,
+    pub depth: usize,
 }
 
 impl AppState {
     fn new() -> Self {
+        let mut _pairs = vec![];
+        _pairs.push("BTC/USD".to_string());
+        _pairs.push("ETH/USD".to_string());
+        _pairs.push("SOL/USD".to_string());
         Self {
-            book: LocalBook::new(),
+            books: HashMap::new(),
             logs: vec!["Initializing Kraken ...".to_string()],
             status: SyncStatus::Healthy,
             last_checksum: 0,
+            curr_index: 0,
+            pairs: _pairs,
+            frozen_view: None,
+            depth: 10,
         }
     }
 
@@ -168,15 +180,30 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
     };
 
     // Define commands
-    let book_sub_cmd =
+    let book_sub_cmd1 =
         r#"{"method":"subscribe", "params":{"channel":"book", "symbol":["BTC/USD"], "depth":10}}"#
             .to_string();
-    let trade_sub_cmd =
+    let book_sub_cmd2 =
+        r#"{"method":"subscribe", "params":{"channel":"book", "symbol":["ETH/USD"], "depth":10}}"#
+            .to_string();
+    let book_sub_cmd3 =
+        r#"{"method":"subscribe", "params":{"channel":"book", "symbol":["SOL/USD"], "depth":10}}"#
+            .to_string();
+    let trade_sub_cmd1 =
         r#"{"method":"subscribe", "params":{"channel":"trade", "symbol":["BTC/USD"]}}"#.to_string();
+    let trade_sub_cmd2 =
+        r#"{"method":"subscribe", "params":{"channel":"trade", "symbol":["ETH/USD"]}}"#.to_string();
+    let trade_sub_cmd3 =
+        r#"{"method":"subscribe", "params":{"channel":"trade", "symbol":["SOL/USD"]}}"#.to_string();
 
     // Use send_raw so the Engine 'remembers' these for auto-reconnect
-    let _ = client.send_raw(book_sub_cmd.clone()).await;
-    let _ = client.send_raw(trade_sub_cmd).await;
+    let _ = client.send_raw(book_sub_cmd1.clone()).await;
+    let _ = client.send_raw(book_sub_cmd2.clone()).await;
+    let _ = client.send_raw(book_sub_cmd3.clone()).await;
+
+    let _ = client.send_raw(trade_sub_cmd1).await;
+    let _ = client.send_raw(trade_sub_cmd2).await;
+    let _ = client.send_raw(trade_sub_cmd3).await;
 
     let mut stream = client.stream();
     state
@@ -204,37 +231,52 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                             let data = &msg.data[0];
 
                             // HEALING LOGIC START
+                            let sym = &data.symbol;
+                            // Ensure entry exists (requires mutable borrow of s)
+                            s.books.entry(sym.clone()).or_insert_with(LocalBook::new);
+
+                            let mut validation_result: Option<(bool, u32)> = None;
+                            let mut snapshot_applied = false;
+
                             if msg.r#type == "snapshot" {
-                                s.book.apply_snapshot(data.bids.clone(), data.asks.clone());
-                                s.log("📸 Snapshot Loaded (Sync Restored)".to_string());
-                                s.status = SyncStatus::Healthy; // Reset status to Green
+                                if let Some(book) = s.books.get_mut(sym) {
+                                    book.apply_snapshot(data.bids.clone(), data.asks.clone());
+                                    snapshot_applied = true;
+                                }
                             } else {
-                                // If recovering, ignore updates until we get a snapshot
-                                if s.status == SyncStatus::Recovering {
-                                    // continue; // CANNOT continue inside block, so we just do nothing
-                                } else {
-                                    s.book.apply_updates(data.bids.clone(), true);
-                                    s.book.apply_updates(data.asks.clone(), false);
+                                if s.status != SyncStatus::Recovering {
+                                    if let Some(book) = s.books.get_mut(sym) {
+                                        book.apply_updates(data.bids.clone(), true);
+                                        book.apply_updates(data.asks.clone(), false);
 
-                                    // Checksum Logic
-                                    let is_valid = validate_checksum(&s.book, data.checksum);
-                                    s.last_checksum = data.checksum;
-
-                                    if !is_valid {
-                                        s.status = SyncStatus::ChecksumFail;
-                                        s.log(format!(
-                                            "❌ Checksum Fail: {}. Triggering Auto-Recovery...",
-                                            data.checksum
-                                        ));
-
-                                        // TRIGGER RECOVERY:
-                                        // 1. Set status to Yellow
-                                        s.status = SyncStatus::Recovering;
-                                        // 2. Clear corrupted book
-                                        s.book = LocalBook::new();
-                                        // 3. Flag for Re-subscribe
-                                        should_recover = true;
+                                        let is_valid = validate_checksum(book, data.checksum);
+                                        validation_result = Some((is_valid, data.checksum));
                                     }
+                                }
+                            }
+
+                            // Now 'book' borrow is gone, we can use 's' mutably again
+                            if snapshot_applied {
+                                s.log(format!("📸 Snapshot Loaded for {} (Sync Restored)", sym));
+                                s.status = SyncStatus::Healthy;
+                            }
+
+                            if let Some((is_valid, checksum)) = validation_result {
+                                s.last_checksum = checksum;
+                                if !is_valid {
+                                    s.status = SyncStatus::ChecksumFail;
+                                    s.log(format!(
+                                        "❌ Checksum Fail for {}: {}. Triggering Auto-Recovery...",
+                                        sym, checksum
+                                    ));
+
+                                    // TRIGGER RECOVERY:
+                                    s.status = SyncStatus::Recovering;
+                                    // Clear corrupted book
+                                    if let Some(book) = s.books.get_mut(sym) {
+                                        *book = LocalBook::new();
+                                    }
+                                    should_recover = true;
                                 }
                             }
                             // HEALING LOGIC END
@@ -245,14 +287,18 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                                 // Whale Alert Logic > $50k
                                 if val > 50_000.0 {
                                     s.log(format!(
-                                        "🚨 WHALE ALERT: {} sold {:.4} BTC (${:.0})",
+                                        "🚨 WHALE ALERT: {} sold {:.4} {} (${:.0})",
                                         t.side.to_uppercase(),
                                         t.qty,
+                                        t.symbol,
                                         val
                                     ));
                                 } else if val > 10_000.0 {
                                     // Log medium trades
-                                    s.log(format!("💰 Trade: {} ${:.0}", t.side, t.price));
+                                    s.log(format!(
+                                        "💰 Trade: {} {} ${:.0}",
+                                        t.symbol, t.side, t.price
+                                    ));
                                 }
                             }
                         }
@@ -262,7 +308,9 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                 } // MutexGuard dropped here
 
                 if should_recover {
-                    let _ = client.send_raw(book_sub_cmd.clone()).await;
+                    let _ = client.send_raw(book_sub_cmd1.clone()).await;
+                    let _ = client.send_raw(book_sub_cmd2.clone()).await;
+                    let _ = client.send_raw(book_sub_cmd3.clone()).await;
                 }
             }
         }
@@ -279,8 +327,37 @@ fn run_ui_loop(
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                if let KeyCode::Char('q') = key.code {
-                    return Ok(());
+                match key.code {
+                    KeyCode::Tab => {
+                        let mut s = state.lock().unwrap();
+                        s.curr_index += 1;
+                        if s.curr_index >= s.books.len() {
+                            s.curr_index = 0;
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        let mut s = state.lock().unwrap();
+                        if s.frozen_view.is_some() {
+                            s.frozen_view = None;
+                        } else {
+                            let current_pair = &s.pairs[s.curr_index];
+                            if let Some(live_book) = s.books.get(current_pair) {
+                                s.frozen_view = Some(live_book.clone());
+                            }
+                        }
+                    }
+                    KeyCode::Char('q') => {
+                        return Ok(());
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        let mut s = state.lock().unwrap();
+                        s.depth = (s.depth + 1).min(50);
+                    }
+                    KeyCode::Char('-') | KeyCode::Char('_') => {
+                        let mut s = state.lock().unwrap();
+                        s.depth = s.depth.saturating_sub(1).max(1);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -307,8 +384,15 @@ fn ui(f: &mut Frame, state: &Arc<Mutex<AppState>>) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[1]);
 
+    let current_pair = &s.pairs[s.curr_index];
+    let depth = s.depth;
+
+    let title_text = format!(
+        "🐙 KRAKEN FORGE SDK TERMINAL [{}] (Depth: {}) 🐙",
+        current_pair, depth
+    );
     // --- WIDGET 1: HEADER ---
-    let title = Paragraph::new("🐙 KRAKEN FORGE SDK TERMINAL 🐙")
+    let title = Paragraph::new(title_text)
         .style(
             Style::default()
                 .fg(Color::Cyan)
@@ -326,21 +410,35 @@ fn ui(f: &mut Frame, state: &Arc<Mutex<AppState>>) {
             .style(Style::default().add_modifier(Modifier::UNDERLINED)),
     );
 
-    for (_price, (p_str, q_str)) in s.book.asks.iter().take(10) {
-        rows.push(Row::new(vec![
-            Cell::from("ASK").style(Style::default().fg(Color::Red)),
-            Cell::from(p_str.as_str()),
-            Cell::from(q_str.as_str()),
-        ]));
-    }
+    let book_to_render = if let Some(frozen) = &s.frozen_view {
+        Some(frozen)
+    } else {
+        s.books.get(current_pair)
+    };
 
-    rows.push(Row::new(vec!["---", "---", "---"]));
+    if let Some(book) = book_to_render {
+        for (_price, (p_str, q_str)) in book.asks.iter().take(depth) {
+            rows.push(Row::new(vec![
+                Cell::from("ASK").style(Style::default().fg(Color::Red)),
+                Cell::from(p_str.as_str()),
+                Cell::from(q_str.as_str()),
+            ]));
+        }
 
-    for (_price, (p_str, q_str)) in s.book.bids.iter().rev().take(10) {
+        rows.push(Row::new(vec!["---", "---", "---"]));
+
+        for (_price, (p_str, q_str)) in book.bids.iter().rev().take(depth) {
+            rows.push(Row::new(vec![
+                Cell::from("BID").style(Style::default().fg(Color::Green)),
+                Cell::from(p_str.as_str()),
+                Cell::from(q_str.as_str()),
+            ]));
+        }
+    } else {
         rows.push(Row::new(vec![
-            Cell::from("BID").style(Style::default().fg(Color::Green)),
-            Cell::from(p_str.as_str()),
-            Cell::from(q_str.as_str()),
+            Cell::from("waiting data...").style(Style::default().fg(Color::DarkGray)),
+            Cell::from("..."),
+            Cell::from("..."),
         ]));
     }
 
@@ -354,7 +452,7 @@ fn ui(f: &mut Frame, state: &Arc<Mutex<AppState>>) {
     )
     .block(
         Block::default()
-            .title(" Order Book (BTC/USD) ")
+            .title(format!(" Order Book ({}) ", current_pair))
             .borders(Borders::ALL),
     );
     f.render_widget(book_table, main_chunks[0]);
