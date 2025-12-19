@@ -1,5 +1,6 @@
-use serde::{Deserialize, Serialize};
+use crate::model::ohlc::OHLCMessage;
 use crate::model::trade::TradeMessage;
+use serde::{Deserialize, Serialize};
 
 use super::ticker::TickerMessage;
 
@@ -14,6 +15,9 @@ pub enum KrakenMessage {
 
     Trade(TradeMessage),
 
+    // OHLC Candlesticks
+    OHLC(OHLCMessage),
+
     // 3. Status
     Status {
         channel: String,
@@ -25,12 +29,12 @@ pub enum KrakenMessage {
         method: String,
         success: bool,
         // capture optional result so we can debug
-        #[serde(default)] 
-        result: serde_json::Value, 
+        #[serde(default)]
+        result: serde_json::Value,
     },
 
     // 5. Heartbeat (Strict Mode: requires type to be "heartbeat" OR channel "heartbeat" with no other data)
-    // We move this to the bottom or make it specific. 
+    // We move this to the bottom or make it specific.
     // Actually, simplest fix is to just let it match but verify channel in logic.
     Heartbeat {
         channel: String,
@@ -58,7 +62,7 @@ pub struct BookData {
 // Book level with exact price/qty strings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookLevel {
-    pub price: String, 
+    pub price: String,
     pub qty: String,
 }
 

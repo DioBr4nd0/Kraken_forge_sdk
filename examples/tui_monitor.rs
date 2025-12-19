@@ -8,6 +8,7 @@ use forge_sdk::book::checksum::validate_checksum;
 use forge_sdk::book::orderbook::LocalBook;
 use forge_sdk::model::message::{BookData, BookLevel, BookMessage, KrakenMessage};
 use memchr::memmem;
+use once_cell::sync::Lazy;
 use ratatui::{prelude::*, widgets::*};
 use regex::Regex;
 use std::{
@@ -16,14 +17,14 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use once_cell::sync::Lazy;
 
 // --- STATIC REGEX COMPILATION (O(1) PERFORMANCE) ---
 static CHANNEL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#""channel":"([^"]+)""#).unwrap());
 static TYPE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#""type":"([^"]+)""#).unwrap());
 static SYMBOL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#""symbol":"([^"]+)""#).unwrap());
 static CHECKSUM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#""checksum":(\d+)"#).unwrap());
-static BOOK_LEVEL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\{"price":([\d.]+),"qty":([\d.]+)\}"#).unwrap());
+static BOOK_LEVEL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"\{"price":([\d.]+),"qty":([\d.]+)\}"#).unwrap());
 
 // --- CONSTANTS ---
 const TRADING_PAIRS: &[&str] = &["BTC/USD", "ETH/USD", "SOL/USD"];
@@ -40,19 +41,19 @@ fn manually_parse_book_message(json: &str) -> Result<KrakenMessage, serde_json::
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
         .unwrap_or_default();
-    
+
     let type_str = TYPE_RE
         .captures(json)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
         .unwrap_or_default();
-    
+
     let symbol = SYMBOL_RE
         .captures(json)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
         .unwrap_or_default();
-    
+
     let checksum: u32 = CHECKSUM_RE
         .captures(json)
         .and_then(|c| c.get(1))
@@ -82,14 +83,14 @@ fn manually_parse_book_message(json: &str) -> Result<KrakenMessage, serde_json::
 fn extract_price_qty_array_from_raw(json: &str, field_name: &str) -> Vec<BookLevel> {
     let pattern = format!("\"{}\":[", field_name);
     let bytes = json.as_bytes();
-    
+
     let finder = memmem::Finder::new(pattern.as_bytes());
-    
+
     let start = match finder.find(bytes) {
         Some(pos) => pos + pattern.len(),
         None => return vec![],
     };
-    
+
     let mut depth = 0;
     let mut end = start;
     for i in start..bytes.len() {
@@ -105,9 +106,9 @@ fn extract_price_qty_array_from_raw(json: &str, field_name: &str) -> Vec<BookLev
             _ => {}
         }
     }
-    
+
     let array_content = &json[start..end];
-    
+
     BOOK_LEVEL_RE
         .captures_iter(array_content)
         .map(|cap| BookLevel {
@@ -125,6 +126,15 @@ enum SyncStatus {
     Recovering,
 }
 
+#[derive(Clone, Debug)]
+struct CandleData {
+    timestamp: f64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+}
+
 struct AppState {
     pub books: HashMap<String, LocalBook>,
     pub logs: Vec<String>,
@@ -134,6 +144,7 @@ struct AppState {
     pub pairs: Vec<String>,
     pub frozen_view: Option<LocalBook>,
     pub depth: usize,
+    pub candles: HashMap<String, Vec<CandleData>>, // Symbol -> Vec of OHLC candles
     pub metrics: Metrics,
 }
 
@@ -142,7 +153,7 @@ struct Metrics {
     pub start_time: Instant,
     pub mps: u64,
     pub last_second_count: u64,
-    pub last_tick: Instant,  // ✅ FIXED: Changed from u64 to Instant
+    pub last_tick: Instant, // ✅ FIXED: Changed from u64 to Instant
     pub processing_latency: Duration,
 }
 
@@ -154,7 +165,7 @@ impl Metrics {
             start_time: now,
             mps: 0,
             last_second_count: 0,
-            last_tick: now,  // ✅ Initialize with Instant
+            last_tick: now, // ✅ Initialize with Instant
             processing_latency: Duration::from_micros(0),
         }
     }
@@ -171,6 +182,10 @@ impl AppState {
             pairs: TRADING_PAIRS.iter().map(|s| s.to_string()).collect(),
             frozen_view: None,
             depth: ORDERBOOK_DEPTH,
+            candles: TRADING_PAIRS
+                .iter()
+                .map(|p| (p.to_string(), Vec::new()))
+                .collect(),
             metrics: Metrics::new(),
         }
     }
@@ -202,9 +217,14 @@ async fn subscribe_to_channels(client: &mut KrakenClient) {
     for pair in TRADING_PAIRS {
         let book_cmd = build_subscription_command("book", pair, Some(ORDERBOOK_DEPTH));
         let trade_cmd = build_subscription_command("trade", pair, None);
-        
+        let ohlc_cmd = format!(
+            r#"{{"method":"subscribe", "params":{{"channel":"ohlc", "symbol":["{}"], "interval":1}}}}"#,
+            pair
+        );
+
         let _ = client.send_raw(book_cmd).await;
         let _ = client.send_raw(trade_cmd).await;
+        let _ = client.send_raw(ohlc_cmd).await;
     }
 }
 
@@ -282,7 +302,7 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
 
                 {
                     let mut s = state.lock().unwrap();
-                    
+
                     // 📊 UPDATE MESSAGE COUNTER
                     s.metrics.total_messages += 1;
 
@@ -290,7 +310,7 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                     if start_process.duration_since(s.metrics.last_tick).as_secs() >= 1 {
                         let current = s.metrics.total_messages;
                         let previous = s.metrics.last_second_count;
-                        
+
                         s.metrics.mps = current - previous;
                         s.metrics.last_second_count = current;
                         s.metrics.last_tick = start_process;
@@ -303,6 +323,9 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                         }
                         KrakenMessage::Trade(msg) => {
                             handle_trade_message(&mut s, msg);
+                        }
+                        KrakenMessage::OHLC(msg) => {
+                            handle_ohlc_message(&mut s, msg);
                         }
                         KrakenMessage::Heartbeat { .. } => {}
                         _ => {}
@@ -325,8 +348,11 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
 fn handle_book_message(state: &mut AppState, msg: BookMessage) -> bool {
     let data = &msg.data[0];
     let sym = &data.symbol;
-    
-    state.books.entry(sym.clone()).or_insert_with(LocalBook::new);
+
+    state
+        .books
+        .entry(sym.clone())
+        .or_insert_with(LocalBook::new);
 
     let mut validation_result: Option<(bool, u32)> = None;
     let mut snapshot_applied = false;
@@ -386,10 +412,39 @@ fn handle_trade_message(state: &mut AppState, msg: forge_sdk::model::trade::Trad
                 val
             ));
         } else if val > MEDIUM_TRADE_THRESHOLD {
-            state.log(format!(
-                "💰 Trade: {} {} ${:.0}",
-                t.symbol, t.side, t.price
-            ));
+            state.log(format!("💰 Trade: {} {} ${:.0}", t.symbol, t.side, t.price));
+        }
+    }
+}
+
+/// Handle OHLC (candlestick) message updates
+fn handle_ohlc_message(state: &mut AppState, msg: forge_sdk::model::ohlc::OHLCMessage) {
+    for candle in msg.data {
+        let symbol = &candle.symbol;
+
+        // Parse timestamp - try to extract from interval_begin string
+        let timestamp = candle.interval_begin.parse::<f64>().unwrap_or_else(|_| {
+            // Fallback: use current time
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as f64
+        });
+
+        if let Some(candles) = state.candles.get_mut(symbol) {
+            // Store complete OHLC data
+            candles.push(CandleData {
+                timestamp,
+                open: candle.open,
+                high: candle.high,
+                low: candle.low,
+                close: candle.close,
+            });
+
+            // Keep only last 100 candles
+            if candles.len() > 100 {
+                candles.remove(0);
+            }
         }
     }
 }
@@ -453,7 +508,11 @@ fn ui(f: &mut Frame, state: &Arc<Mutex<AppState>>) {
 
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
         .split(chunks[1]);
 
     let current_pair = &s.pairs[s.curr_index];
@@ -461,12 +520,16 @@ fn ui(f: &mut Frame, state: &Arc<Mutex<AppState>>) {
 
     render_header(f, chunks[0], current_pair, depth);
     render_order_book(f, main_chunks[0], &s, current_pair, depth);
-    render_logs(f, main_chunks[1], &s);
+    render_price_chart(f, main_chunks[1], &s, current_pair);
+    render_logs(f, main_chunks[2], &s);
     render_footer(f, chunks[2], &s);
 }
 
 fn render_header(f: &mut Frame, area: Rect, pair: &str, depth: usize) {
-    let title_text = format!("🐙 KRAKEN FORGE SDK TERMINAL [{}] (Depth: {}) 🐙", pair, depth);
+    let title_text = format!(
+        "🐙 KRAKEN FORGE SDK TERMINAL [{}] (Depth: {}) 🐙",
+        pair, depth
+    );
     let title = Paragraph::new(title_text)
         .style(
             Style::default()
@@ -529,6 +592,150 @@ fn render_order_book(f: &mut Frame, area: Rect, state: &AppState, pair: &str, de
     f.render_widget(book_table, area);
 }
 
+fn render_price_chart(f: &mut Frame, area: Rect, state: &AppState, pair: &str) {
+    // Get candlestick data for current pair
+    let data = state.candles.get(pair).map(|v| v.as_slice()).unwrap_or(&[]);
+
+    if data.is_empty() {
+        // Show placeholder when no data
+        let placeholder = Paragraph::new("Waiting for OHLC data...")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .title(format!(" Candlestick Chart ({}) ", pair))
+                    .borders(Borders::ALL),
+            );
+        f.render_widget(placeholder, area);
+        return;
+    }
+
+    // Calculate price bounds
+    let min_price = data.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
+    let max_price = data
+        .iter()
+        .map(|c| c.high)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let price_range = max_price - min_price;
+    if price_range == 0.0 {
+        let placeholder = Paragraph::new("Insufficient price movement...")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .title(format!(" Candlestick Chart ({}) ", pair))
+                    .borders(Borders::ALL),
+            );
+        f.render_widget(placeholder, area);
+        return;
+    }
+
+    // Build candlestick text representation
+    let inner_area = Block::default()
+        .title(format!(" Candlestick Chart ({}) ", pair))
+        .borders(Borders::ALL)
+        .inner(area);
+
+    let chart_height = (inner_area.height.saturating_sub(2)) as usize;
+    let chart_width = inner_area.width.saturating_sub(4) as usize;
+
+    if chart_height == 0 || chart_width == 0 {
+        let block = Block::default()
+            .title(format!(" Candlestick Chart ({}) ", pair))
+            .borders(Borders::ALL);
+        f.render_widget(block, area);
+        return;
+    }
+
+    // Sample candles to fit width (show last N candles)
+    let num_candles = chart_width.min(data.len());
+    let candles_to_show: Vec<&CandleData> = data.iter().rev().take(num_candles).rev().collect();
+
+    // Build the candlestick visualization
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Price labels on the left
+    let price_label_top = format!("${:.2}", max_price);
+    let price_label_mid = format!("${:.2}", (max_price + min_price) / 2.0);
+    let price_label_bot = format!("${:.2}", min_price);
+
+    // Build rows from top to bottom
+    for row in 0..chart_height {
+        let price_at_row = max_price - (row as f64 / chart_height as f64) * price_range;
+
+        let mut spans = Vec::new();
+
+        // Add price label on select rows
+        if row == 0 {
+            spans.push(Span::styled(
+                format!("{:<8} ", price_label_top),
+                Style::default().fg(Color::Gray),
+            ));
+        } else if row == chart_height / 2 {
+            spans.push(Span::styled(
+                format!("{:<8} ", price_label_mid),
+                Style::default().fg(Color::Gray),
+            ));
+        } else if row == chart_height - 1 {
+            spans.push(Span::styled(
+                format!("{:<8} ", price_label_bot),
+                Style::default().fg(Color::Gray),
+            ));
+        } else {
+            spans.push(Span::raw("         "));
+        }
+
+        // Draw each candle
+        for candle in &candles_to_show {
+            let (char_to_draw, color) = get_candle_char_at_price(candle, price_at_row, price_range);
+            spans.push(Span::styled(
+                char_to_draw.to_string(),
+                Style::default().fg(color),
+            ));
+            // Add space between candlesticks for clarity
+            spans.push(Span::raw(" "));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(format!(" Candlestick Chart ({}) ", pair))
+            .borders(Borders::ALL),
+    );
+
+    f.render_widget(paragraph, area);
+}
+
+// Helper function to determine what character to draw for a candle at a given price level
+fn get_candle_char_at_price(
+    candle: &CandleData,
+    price_at_row: f64,
+    price_range: f64,
+) -> (char, Color) {
+    let is_bullish = candle.close >= candle.open;
+    let color = if is_bullish { Color::Green } else { Color::Red };
+
+    let body_top = candle.close.max(candle.open);
+    let body_bottom = candle.close.min(candle.open);
+
+    let tolerance = price_range * 0.01; // 1% tolerance for rendering
+
+    // Check if price is within the wick range (high to low)
+    if price_at_row <= candle.high + tolerance && price_at_row >= candle.low - tolerance {
+        // Check if within body
+        if price_at_row <= body_top + tolerance && price_at_row >= body_bottom - tolerance {
+            ('█', color) // Full block for body
+        } else {
+            ('│', color) // Vertical line for wick
+        }
+    } else {
+        (' ', Color::Reset) // Empty space
+    }
+}
+
 fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
     let log_items: Vec<ListItem> = state
         .logs
@@ -562,11 +769,19 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
 fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     let uptime_secs = state.metrics.start_time.elapsed().as_secs();
     let latency_micros = state.metrics.processing_latency.as_micros();
-    
+
     let (status_indicator, status_style) = match state.status {
         SyncStatus::Healthy => ("✅", Style::default().fg(Color::Green)),
-        SyncStatus::ChecksumFail => ("❌", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        SyncStatus::Recovering => ("⚠️", Style::default().fg(Color::Yellow).add_modifier(Modifier::RAPID_BLINK)),
+        SyncStatus::ChecksumFail => (
+            "❌",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        SyncStatus::Recovering => (
+            "⚠️",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::RAPID_BLINK),
+        ),
     };
 
     let footer_text = format!(

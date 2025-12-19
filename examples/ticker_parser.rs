@@ -62,6 +62,7 @@ async fn main() {
                     // Print the raw string so we can debug why it failed
                     eprintln!("Raw: {}", json_text);
                 }
+            _ => {}
             }
             }
         }
