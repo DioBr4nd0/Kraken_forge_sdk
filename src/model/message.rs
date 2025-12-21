@@ -1,4 +1,6 @@
 use crate::model::ohlc::OHLCMessage;
+use crate::model::open_orders::OpenOrdersMessage;
+use crate::model::own_trades::OwnTradesMessage;
 use crate::model::trade::TradeMessage;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +19,10 @@ pub enum KrakenMessage {
 
     // OHLC Candlesticks
     OHLC(OHLCMessage),
+
+    // Private Authenticated Feeds
+    OwnTrades(OwnTradesMessage),
+    OpenOrders(OpenOrdersMessage),
 
     // 3. Status
     Status {

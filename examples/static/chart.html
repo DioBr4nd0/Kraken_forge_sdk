@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kraken Candlestick Chart</title>
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            margin-bottom: 20px;
+        }
+        h1 {
+            font-size: 1.8rem;
+            background: linear-gradient(90deg, #00d4ff, #7b2cbf);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+        select {
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(255,255,255,0.05);
+            color: #fff;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        select:hover {
+            border-color: #00d4ff;
+            background: rgba(0,212,255,0.1);
+        }
+        select:focus {
+            outline: none;
+            border-color: #00d4ff;
+            box-shadow: 0 0 10px rgba(0,212,255,0.3);
+        }
+        .chart-container {
+            background: rgba(0,0,0,0.3);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+        }
+        #chart {
+            width: 100%;
+            height: 600px;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px 0;
+            margin-top: 15px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            font-size: 13px;
+            color: #888;
+        }
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4CAF50;
+            animation: pulse 2s infinite;
+        }
+        .status-dot.disconnected {
+            background: #f44336;
+            animation: none;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .price-info {
+            display: flex;
+            gap: 20px;
+        }
+        .price-item {
+            display: flex;
+            flex-direction: column;
+        }
+        .price-label {
+            font-size: 11px;
+            color: #666;
+            text-transform: uppercase;
+        }
+        .price-value {
+            font-size: 16px;
+            font-weight: 600;
+        }
+        .price-value.up { color: #4CAF50; }
+        .price-value.down { color: #f44336; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📈 Kraken Chart</h1>
+            <div class="controls">
+                <select id="symbol">
+                    <option value="BTC/USD">BTC/USD</option>
+                    <option value="ETH/USD">ETH/USD</option>
+                    <option value="SOL/USD">SOL/USD</option>
+                </select>
+                <select id="interval">
+                    <option value="1">1 Minute</option>
+                    <option value="5">5 Minutes</option>
+                    <option value="15">15 Minutes</option>
+                    <option value="30">30 Minutes</option>
+                    <option value="60" selected>1 Hour</option>
+                    <option value="240">4 Hours</option>
+                    <option value="1440">1 Day</option>
+                    <option value="10080">1 Week</option>
+                    <option value="21600">15 Days</option>
+                </select>
+            </div>
+        </header>
+
+        <div class="chart-container">
+            <div id="chart"></div>
+            <div class="status-bar">
+                <div class="status">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span id="statusText">Connecting...</span>
+                </div>
+                <div class="price-info">
+                    <div class="price-item">
+                        <span class="price-label">Last Price</span>
+                        <span class="price-value" id="lastPrice">-</span>
+                    </div>
+                    <div class="price-item">
+                        <span class="price-label">Candles</span>
+                        <span class="price-value" id="candleCount">0</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Chart setup
+        const chartContainer = document.getElementById('chart');
+        const chart = LightweightCharts.createChart(chartContainer, {
+            layout: {
+                background: { type: 'solid', color: 'transparent' },
+                textColor: '#9B9B9B',
+            },
+            grid: {
+                vertLines: { color: 'rgba(255,255,255,0.05)' },
+                horzLines: { color: 'rgba(255,255,255,0.05)' },
+            },
+            crosshair: {
+                mode: LightweightCharts.CrosshairMode.Normal,
+            },
+            rightPriceScale: {
+                borderColor: 'rgba(255,255,255,0.1)',
+            },
+            timeScale: {
+                borderColor: 'rgba(255,255,255,0.1)',
+                timeVisible: true,
+                secondsVisible: false,
+            },
+        });
+
+        const candleSeries = chart.addCandlestickSeries({
+            upColor: '#4CAF50',
+            downColor: '#f44336',
+            borderUpColor: '#4CAF50',
+            borderDownColor: '#f44336',
+            wickUpColor: '#4CAF50',
+            wickDownColor: '#f44336',
+        });
+
+        // Elements
+        const symbolSelect = document.getElementById('symbol');
+        const intervalSelect = document.getElementById('interval');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const lastPriceEl = document.getElementById('lastPrice');
+        const candleCountEl = document.getElementById('candleCount');
+
+        let ws = null;
+        let currentSymbol = symbolSelect.value;
+        let currentInterval = parseInt(intervalSelect.value);
+
+        // Fetch historical data
+        async function loadHistoricalData() {
+            statusText.textContent = 'Loading historical data...';
+            
+            try {
+                const response = await fetch(`/api/ohlc?pair=${currentSymbol}&interval=${currentInterval}`);
+                const data = await response.json();
+                
+                if (data.candles && data.candles.length > 0) {
+                    const chartData = data.candles.map(c => ({
+                        time: c.time,
+                        open: c.open,
+                        high: c.high,
+                        low: c.low,
+                        close: c.close,
+                    }));
+                    
+                    candleSeries.setData(chartData);
+                    candleCountEl.textContent = chartData.length;
+                    
+                    const lastCandle = chartData[chartData.length - 1];
+                    updateLastPrice(lastCandle.close, lastCandle.open);
+                    
+                    statusText.textContent = `Loaded ${chartData.length} candles`;
+                }
+            } catch (err) {
+                statusText.textContent = 'Error loading data';
+                console.error(err);
+            }
+        }
+
+        // Connect WebSocket for live updates
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+            
+            ws.onopen = () => {
+                statusDot.classList.remove('disconnected');
+                statusText.textContent = 'Live - Connected';
+            };
+            
+            ws.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    if (msg.type === 'ohlc' && msg.data) {
+                        msg.data.forEach(candle => {
+                            // Only update if matches current symbol and interval
+                            if (candle.symbol === currentSymbol && candle.interval === currentInterval) {
+                                candleSeries.update({
+                                    time: candle.time,
+                                    open: candle.open,
+                                    high: candle.high,
+                                    low: candle.low,
+                                    close: candle.close,
+                                });
+                                updateLastPrice(candle.close, candle.open);
+                            }
+                        });
+                    }
+                } catch (err) {
+                    console.error('WS message error:', err);
+                }
+            };
+            
+            ws.onclose = () => {
+                statusDot.classList.add('disconnected');
+                statusText.textContent = 'Disconnected - Reconnecting...';
+                setTimeout(connectWebSocket, 3000);
+            };
+            
+            ws.onerror = () => {
+                statusDot.classList.add('disconnected');
+            };
+        }
+
+        function updateLastPrice(close, open) {
+            lastPriceEl.textContent = '$' + close.toLocaleString(undefined, {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            });
+            lastPriceEl.className = 'price-value ' + (close >= open ? 'up' : 'down');
+        }
+
+        // Event listeners
+        symbolSelect.addEventListener('change', () => {
+            currentSymbol = symbolSelect.value;
+            loadHistoricalData();
+        });
+
+        intervalSelect.addEventListener('change', () => {
+            currentInterval = parseInt(intervalSelect.value);
+            loadHistoricalData();
+        });
+
+        // Handle resize
+        new ResizeObserver(() => {
+            chart.applyOptions({ width: chartContainer.clientWidth });
+        }).observe(chartContainer);
+
+        // Initialize
+        loadHistoricalData();
+        connectWebSocket();
+    </script>
+</body>
+</html>

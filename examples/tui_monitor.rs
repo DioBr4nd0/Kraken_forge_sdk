@@ -124,15 +124,7 @@ enum SyncStatus {
     Healthy,
     ChecksumFail,
     Recovering,
-}
-
-#[derive(Clone, Debug)]
-struct CandleData {
-    timestamp: f64,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
+    NetworkLost,
 }
 
 struct AppState {
@@ -144,7 +136,6 @@ struct AppState {
     pub pairs: Vec<String>,
     pub frozen_view: Option<LocalBook>,
     pub depth: usize,
-    pub candles: HashMap<String, Vec<CandleData>>, // Symbol -> Vec of OHLC candles
     pub metrics: Metrics,
 }
 
@@ -153,8 +144,9 @@ struct Metrics {
     pub start_time: Instant,
     pub mps: u64,
     pub last_second_count: u64,
-    pub last_tick: Instant, // ✅ FIXED: Changed from u64 to Instant
+    pub last_tick: Instant,
     pub processing_latency: Duration,
+    pub last_message_time: Instant, // Track when last message received
 }
 
 impl Metrics {
@@ -165,8 +157,9 @@ impl Metrics {
             start_time: now,
             mps: 0,
             last_second_count: 0,
-            last_tick: now, // ✅ Initialize with Instant
+            last_tick: now,
             processing_latency: Duration::from_micros(0),
+            last_message_time: now,
         }
     }
 }
@@ -182,10 +175,6 @@ impl AppState {
             pairs: TRADING_PAIRS.iter().map(|s| s.to_string()).collect(),
             frozen_view: None,
             depth: ORDERBOOK_DEPTH,
-            candles: TRADING_PAIRS
-                .iter()
-                .map(|p| (p.to_string(), Vec::new()))
-                .collect(),
             metrics: Metrics::new(),
         }
     }
@@ -285,60 +274,74 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
         .unwrap()
         .log("Connected & Subscribed.".to_string());
 
+    // Simple non-blocking message loop - UI will detect stale data
     while let Some(msg_res) = stream.recv().await {
-        if let Ok(txt) = msg_res {
-            // ⏱️ START PERFORMANCE TRACKING
-            let start_process = Instant::now();
+        match msg_res {
+            Ok(txt) => {
+                // ⏱️ START PERFORMANCE TRACKING
+                let start_process = Instant::now();
 
-            // Parse message
-            let parsed = if txt.contains("\"channel\":\"book\"") {
-                manually_parse_book_message(&txt)
-            } else {
-                serde_json::from_str::<KrakenMessage>(&txt)
-            };
+                // Parse message
+                let parsed = if txt.contains("\"channel\":\"book\"") {
+                    manually_parse_book_message(&txt)
+                } else {
+                    serde_json::from_str::<KrakenMessage>(&txt)
+                };
 
-            if let Ok(parsed) = parsed {
-                let mut should_recover = false;
+                if let Ok(parsed) = parsed {
+                    let mut should_recover = false;
 
-                {
-                    let mut s = state.lock().unwrap();
+                    {
+                        let mut s = state.lock().unwrap();
 
-                    // 📊 UPDATE MESSAGE COUNTER
-                    s.metrics.total_messages += 1;
+                        // 📊 UPDATE MESSAGE COUNTER & LAST MESSAGE TIME
+                        s.metrics.total_messages += 1;
+                        s.metrics.last_message_time = start_process;
 
-                    // 🚀 CALCULATE MESSAGES PER SECOND (MPS)
-                    if start_process.duration_since(s.metrics.last_tick).as_secs() >= 1 {
-                        let current = s.metrics.total_messages;
-                        let previous = s.metrics.last_second_count;
+                        // Restore healthy status if was network lost
+                        if s.status == SyncStatus::NetworkLost {
+                            s.status = SyncStatus::Healthy;
+                            s.log("✅ Network connection restored!".to_string());
+                        }
 
-                        s.metrics.mps = current - previous;
-                        s.metrics.last_second_count = current;
-                        s.metrics.last_tick = start_process;
+                        // 🚀 CALCULATE MESSAGES PER SECOND (MPS)
+                        if start_process.duration_since(s.metrics.last_tick).as_secs() >= 1 {
+                            let current = s.metrics.total_messages;
+                            let previous = s.metrics.last_second_count;
+
+                            s.metrics.mps = current - previous;
+                            s.metrics.last_second_count = current;
+                            s.metrics.last_tick = start_process;
+                        }
+
+                        // Process message types
+                        match parsed {
+                            KrakenMessage::Book(msg) => {
+                                should_recover = handle_book_message(&mut s, msg);
+                            }
+                            KrakenMessage::Trade(msg) => {
+                                handle_trade_message(&mut s, msg);
+                            }
+                            KrakenMessage::OHLC(_) => {} // Handled by chart_viewer example
+                            KrakenMessage::Heartbeat { .. } => {}
+                            _ => {}
+                        }
+
+                        // ⚡ MEASURE PROCESSING LATENCY
+                        let elapsed = start_process.elapsed();
+                        s.metrics.processing_latency = elapsed;
                     }
 
-                    // Process message types
-                    match parsed {
-                        KrakenMessage::Book(msg) => {
-                            should_recover = handle_book_message(&mut s, msg);
-                        }
-                        KrakenMessage::Trade(msg) => {
-                            handle_trade_message(&mut s, msg);
-                        }
-                        KrakenMessage::OHLC(msg) => {
-                            handle_ohlc_message(&mut s, msg);
-                        }
-                        KrakenMessage::Heartbeat { .. } => {}
-                        _ => {}
+                    if should_recover {
+                        subscribe_to_channels(&mut client).await;
                     }
-
-                    // ⚡ MEASURE PROCESSING LATENCY
-                    let elapsed = start_process.elapsed();
-                    s.metrics.processing_latency = elapsed;
                 }
-
-                if should_recover {
-                    subscribe_to_channels(&mut client).await;
-                }
+            }
+            Err(_e) => {
+                // WebSocket error - mark as network lost
+                let mut s = state.lock().unwrap();
+                s.status = SyncStatus::NetworkLost;
+                s.log("🔌 WebSocket error - connection issue".to_string());
             }
         }
     }
@@ -417,44 +420,22 @@ fn handle_trade_message(state: &mut AppState, msg: forge_sdk::model::trade::Trad
     }
 }
 
-/// Handle OHLC (candlestick) message updates
-fn handle_ohlc_message(state: &mut AppState, msg: forge_sdk::model::ohlc::OHLCMessage) {
-    for candle in msg.data {
-        let symbol = &candle.symbol;
-
-        // Parse timestamp - try to extract from interval_begin string
-        let timestamp = candle.interval_begin.parse::<f64>().unwrap_or_else(|_| {
-            // Fallback: use current time
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as f64
-        });
-
-        if let Some(candles) = state.candles.get_mut(symbol) {
-            // Store complete OHLC data
-            candles.push(CandleData {
-                timestamp,
-                open: candle.open,
-                high: candle.high,
-                low: candle.low,
-                close: candle.close,
-            });
-
-            // Keep only last 100 candles
-            if candles.len() > 100 {
-                candles.remove(0);
-            }
-        }
-    }
-}
-
 // --- UI LOOP ---
 fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: Arc<Mutex<AppState>>,
 ) -> io::Result<()> {
     loop {
+        // Check if data is stale (no message in 5 seconds = network issue)
+        {
+            let mut s = state.lock().unwrap();
+            let time_since_last_msg = s.metrics.last_message_time.elapsed();
+            if time_since_last_msg > Duration::from_secs(5) && s.status != SyncStatus::NetworkLost {
+                s.status = SyncStatus::NetworkLost;
+                s.log("🔌 Network Lost - No data for 5 seconds".to_string());
+            }
+        }
+
         terminal.draw(|f| ui(f, &state))?;
 
         if event::poll(Duration::from_millis(UI_POLL_INTERVAL_MS))? {
@@ -508,11 +489,7 @@ fn ui(f: &mut Frame, state: &Arc<Mutex<AppState>>) {
 
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[1]);
 
     let current_pair = &s.pairs[s.curr_index];
@@ -520,8 +497,7 @@ fn ui(f: &mut Frame, state: &Arc<Mutex<AppState>>) {
 
     render_header(f, chunks[0], current_pair, depth);
     render_order_book(f, main_chunks[0], &s, current_pair, depth);
-    render_price_chart(f, main_chunks[1], &s, current_pair);
-    render_logs(f, main_chunks[2], &s);
+    render_logs(f, main_chunks[1], &s);
     render_footer(f, chunks[2], &s);
 }
 
@@ -592,150 +568,6 @@ fn render_order_book(f: &mut Frame, area: Rect, state: &AppState, pair: &str, de
     f.render_widget(book_table, area);
 }
 
-fn render_price_chart(f: &mut Frame, area: Rect, state: &AppState, pair: &str) {
-    // Get candlestick data for current pair
-    let data = state.candles.get(pair).map(|v| v.as_slice()).unwrap_or(&[]);
-
-    if data.is_empty() {
-        // Show placeholder when no data
-        let placeholder = Paragraph::new("Waiting for OHLC data...")
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .title(format!(" Candlestick Chart ({}) ", pair))
-                    .borders(Borders::ALL),
-            );
-        f.render_widget(placeholder, area);
-        return;
-    }
-
-    // Calculate price bounds
-    let min_price = data.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
-    let max_price = data
-        .iter()
-        .map(|c| c.high)
-        .fold(f64::NEG_INFINITY, f64::max);
-
-    let price_range = max_price - min_price;
-    if price_range == 0.0 {
-        let placeholder = Paragraph::new("Insufficient price movement...")
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .title(format!(" Candlestick Chart ({}) ", pair))
-                    .borders(Borders::ALL),
-            );
-        f.render_widget(placeholder, area);
-        return;
-    }
-
-    // Build candlestick text representation
-    let inner_area = Block::default()
-        .title(format!(" Candlestick Chart ({}) ", pair))
-        .borders(Borders::ALL)
-        .inner(area);
-
-    let chart_height = (inner_area.height.saturating_sub(2)) as usize;
-    let chart_width = inner_area.width.saturating_sub(4) as usize;
-
-    if chart_height == 0 || chart_width == 0 {
-        let block = Block::default()
-            .title(format!(" Candlestick Chart ({}) ", pair))
-            .borders(Borders::ALL);
-        f.render_widget(block, area);
-        return;
-    }
-
-    // Sample candles to fit width (show last N candles)
-    let num_candles = chart_width.min(data.len());
-    let candles_to_show: Vec<&CandleData> = data.iter().rev().take(num_candles).rev().collect();
-
-    // Build the candlestick visualization
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Price labels on the left
-    let price_label_top = format!("${:.2}", max_price);
-    let price_label_mid = format!("${:.2}", (max_price + min_price) / 2.0);
-    let price_label_bot = format!("${:.2}", min_price);
-
-    // Build rows from top to bottom
-    for row in 0..chart_height {
-        let price_at_row = max_price - (row as f64 / chart_height as f64) * price_range;
-
-        let mut spans = Vec::new();
-
-        // Add price label on select rows
-        if row == 0 {
-            spans.push(Span::styled(
-                format!("{:<8} ", price_label_top),
-                Style::default().fg(Color::Gray),
-            ));
-        } else if row == chart_height / 2 {
-            spans.push(Span::styled(
-                format!("{:<8} ", price_label_mid),
-                Style::default().fg(Color::Gray),
-            ));
-        } else if row == chart_height - 1 {
-            spans.push(Span::styled(
-                format!("{:<8} ", price_label_bot),
-                Style::default().fg(Color::Gray),
-            ));
-        } else {
-            spans.push(Span::raw("         "));
-        }
-
-        // Draw each candle
-        for candle in &candles_to_show {
-            let (char_to_draw, color) = get_candle_char_at_price(candle, price_at_row, price_range);
-            spans.push(Span::styled(
-                char_to_draw.to_string(),
-                Style::default().fg(color),
-            ));
-            // Add space between candlesticks for clarity
-            spans.push(Span::raw(" "));
-        }
-
-        lines.push(Line::from(spans));
-    }
-
-    let paragraph = Paragraph::new(lines).block(
-        Block::default()
-            .title(format!(" Candlestick Chart ({}) ", pair))
-            .borders(Borders::ALL),
-    );
-
-    f.render_widget(paragraph, area);
-}
-
-// Helper function to determine what character to draw for a candle at a given price level
-fn get_candle_char_at_price(
-    candle: &CandleData,
-    price_at_row: f64,
-    price_range: f64,
-) -> (char, Color) {
-    let is_bullish = candle.close >= candle.open;
-    let color = if is_bullish { Color::Green } else { Color::Red };
-
-    let body_top = candle.close.max(candle.open);
-    let body_bottom = candle.close.min(candle.open);
-
-    let tolerance = price_range * 0.01; // 1% tolerance for rendering
-
-    // Check if price is within the wick range (high to low)
-    if price_at_row <= candle.high + tolerance && price_at_row >= candle.low - tolerance {
-        // Check if within body
-        if price_at_row <= body_top + tolerance && price_at_row >= body_bottom - tolerance {
-            ('█', color) // Full block for body
-        } else {
-            ('│', color) // Vertical line for wick
-        }
-    } else {
-        (' ', Color::Reset) // Empty space
-    }
-}
-
 fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
     let log_items: Vec<ListItem> = state
         .logs
@@ -771,15 +603,21 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     let latency_micros = state.metrics.processing_latency.as_micros();
 
     let (status_indicator, status_style) = match state.status {
-        SyncStatus::Healthy => ("✅", Style::default().fg(Color::Green)),
+        SyncStatus::Healthy => ("✅ Checksum Valid", Style::default().fg(Color::Green)),
         SyncStatus::ChecksumFail => (
-            "❌",
+            "❌ Checksum Mismatch",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         SyncStatus::Recovering => (
-            "⚠️",
+            "⚠️ Recovering...",
             Style::default()
                 .fg(Color::Yellow)
+                .add_modifier(Modifier::RAPID_BLINK),
+        ),
+        SyncStatus::NetworkLost => (
+            "🔌 Network Lost - Reconnecting...",
+            Style::default()
+                .fg(Color::Red)
                 .add_modifier(Modifier::RAPID_BLINK),
         ),
     };

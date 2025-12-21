@@ -13,7 +13,10 @@ pub enum KrakenError {
 
     #[error("Internal channel closed")]
     ChannelClosed,
-    
+
     #[error("Invalid URL")]
     UrlParseError(#[from] url::ParseError),
+
+    #[error("Authentication failed: {0}")]
+    AuthError(String),
 }
