@@ -1,5 +1,4 @@
 use crate::error::KrakenError;
-use crate::model::message::KrakenMessage;
 use crate::network::connection::ConnectionManager;
 use tokio::sync::mpsc;
 

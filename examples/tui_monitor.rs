@@ -4,7 +4,6 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use forge_sdk::KrakenClient;
-use forge_sdk::book::checksum::validate_checksum;
 use forge_sdk::book::orderbook::LocalBook;
 use forge_sdk::model::message::{BookData, BookLevel, BookMessage, KrakenMessage};
 use memchr::memmem;
@@ -28,7 +27,7 @@ static BOOK_LEVEL_RE: Lazy<Regex> =
 
 // --- CONSTANTS ---
 const TRADING_PAIRS: &[&str] = &["BTC/USD", "ETH/USD", "SOL/USD"];
-const ORDERBOOK_DEPTH: usize = 10;
+const DEFAULT_ORDERBOOK_DEPTH: usize = 10;
 const MAX_LOG_ENTRIES: usize = 50;
 const UI_POLL_INTERVAL_MS: u64 = 50;
 const WHALE_ALERT_THRESHOLD: f64 = 50_000.0;
@@ -135,7 +134,6 @@ struct AppState {
     pub curr_index: usize,
     pub pairs: Vec<String>,
     pub frozen_view: Option<LocalBook>,
-    pub depth: usize,
     pub metrics: Metrics,
 }
 
@@ -147,6 +145,7 @@ struct Metrics {
     pub last_tick: Instant,
     pub processing_latency: Duration,
     pub last_message_time: Instant, // Track when last message received
+    pub recovery_started: Option<Instant>, // Track when recovery started
 }
 
 impl Metrics {
@@ -160,6 +159,7 @@ impl Metrics {
             last_tick: now,
             processing_latency: Duration::from_micros(0),
             last_message_time: now,
+            recovery_started: None,
         }
     }
 }
@@ -174,7 +174,6 @@ impl AppState {
             curr_index: 0,
             pairs: TRADING_PAIRS.iter().map(|s| s.to_string()).collect(),
             frozen_view: None,
-            depth: ORDERBOOK_DEPTH,
             metrics: Metrics::new(),
         }
     }
@@ -204,7 +203,7 @@ fn build_subscription_command(channel: &str, symbol: &str, depth: Option<usize>)
 
 async fn subscribe_to_channels(client: &mut KrakenClient) {
     for pair in TRADING_PAIRS {
-        let book_cmd = build_subscription_command("book", pair, Some(ORDERBOOK_DEPTH));
+        let book_cmd = build_subscription_command("book", pair, Some(DEFAULT_ORDERBOOK_DEPTH));
         let trade_cmd = build_subscription_command("trade", pair, None);
         let ohlc_cmd = format!(
             r#"{{"method":"subscribe", "params":{{"channel":"ohlc", "symbol":["{}"], "interval":1}}}}"#,
@@ -289,8 +288,6 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                 };
 
                 if let Ok(parsed) = parsed {
-                    let mut should_recover = false;
-
                     {
                         let mut s = state.lock().unwrap();
 
@@ -302,6 +299,12 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                         if s.status == SyncStatus::NetworkLost {
                             s.status = SyncStatus::Healthy;
                             s.log("✅ Network connection restored!".to_string());
+                        }
+
+                        // Auto-recover from Recovering state when we receive messages
+                        if s.status == SyncStatus::Recovering {
+                            s.status = SyncStatus::Healthy;
+                            s.metrics.recovery_started = None;
                         }
 
                         // 🚀 CALCULATE MESSAGES PER SECOND (MPS)
@@ -317,7 +320,7 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                         // Process message types
                         match parsed {
                             KrakenMessage::Book(msg) => {
-                                should_recover = handle_book_message(&mut s, msg);
+                                handle_book_message(&mut s, msg);
                             }
                             KrakenMessage::Trade(msg) => {
                                 handle_trade_message(&mut s, msg);
@@ -331,10 +334,6 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                         let elapsed = start_process.elapsed();
                         s.metrics.processing_latency = elapsed;
                     }
-
-                    if should_recover {
-                        subscribe_to_channels(&mut client).await;
-                    }
                 }
             }
             Err(_e) => {
@@ -347,8 +346,8 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
     }
 }
 
-/// Handle book message updates with checksum validation and recovery
-fn handle_book_message(state: &mut AppState, msg: BookMessage) -> bool {
+/// Handle book message updates - simplified, no checksum validation
+fn handle_book_message(state: &mut AppState, msg: BookMessage) {
     let data = &msg.data[0];
     let sym = &data.symbol;
 
@@ -357,49 +356,21 @@ fn handle_book_message(state: &mut AppState, msg: BookMessage) -> bool {
         .entry(sym.clone())
         .or_insert_with(LocalBook::new);
 
-    let mut validation_result: Option<(bool, u32)> = None;
-    let mut snapshot_applied = false;
-
     if msg.r#type == "snapshot" {
         if let Some(book) = state.books.get_mut(sym) {
             book.apply_snapshot(data.bids.clone(), data.asks.clone());
-            snapshot_applied = true;
+            state.log(format!("📸 Snapshot Loaded for {}", sym));
         }
     } else {
-        if state.status != SyncStatus::Recovering {
-            if let Some(book) = state.books.get_mut(sym) {
-                book.apply_updates(data.bids.clone(), true);
-                book.apply_updates(data.asks.clone(), false);
-
-                let is_valid = validate_checksum(book, data.checksum);
-                validation_result = Some((is_valid, data.checksum));
-            }
+        // Apply delta updates
+        if let Some(book) = state.books.get_mut(sym) {
+            book.apply_updates(data.bids.clone(), true);
+            book.apply_updates(data.asks.clone(), false);
         }
     }
 
-    if snapshot_applied {
-        state.log(format!("📸 Snapshot Loaded for {} (Sync Restored)", sym));
-        state.status = SyncStatus::Healthy;
-    }
-
-    if let Some((is_valid, checksum)) = validation_result {
-        state.last_checksum = checksum;
-        if !is_valid {
-            state.status = SyncStatus::ChecksumFail;
-            state.log(format!(
-                "❌ Checksum Fail for {}: {}. Triggering Auto-Recovery...",
-                sym, checksum
-            ));
-
-            state.status = SyncStatus::Recovering;
-            if let Some(book) = state.books.get_mut(sym) {
-                *book = LocalBook::new();
-            }
-            return true;
-        }
-    }
-
-    false
+    // Store last checksum for display purposes only (not validated)
+    state.last_checksum = data.checksum;
 }
 
 /// Handle trade messages with whale detection
@@ -459,14 +430,6 @@ fn run_ui_loop(
                     KeyCode::Char('q') => {
                         return Ok(());
                     }
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
-                        let mut s = state.lock().unwrap();
-                        s.depth = (s.depth + 1).min(50);
-                    }
-                    KeyCode::Char('-') | KeyCode::Char('_') => {
-                        let mut s = state.lock().unwrap();
-                        s.depth = s.depth.saturating_sub(1).max(1);
-                    }
                     _ => {}
                 }
             }
@@ -493,18 +456,17 @@ fn ui(f: &mut Frame, state: &Arc<Mutex<AppState>>) {
         .split(chunks[1]);
 
     let current_pair = &s.pairs[s.curr_index];
-    let depth = s.depth;
 
-    render_header(f, chunks[0], current_pair, depth);
-    render_order_book(f, main_chunks[0], &s, current_pair, depth);
+    render_header(f, chunks[0], current_pair);
+    render_order_book(f, main_chunks[0], &s, current_pair);
     render_logs(f, main_chunks[1], &s);
     render_footer(f, chunks[2], &s);
 }
 
-fn render_header(f: &mut Frame, area: Rect, pair: &str, depth: usize) {
+fn render_header(f: &mut Frame, area: Rect, pair: &str) {
     let title_text = format!(
         "🐙 KRAKEN FORGE SDK TERMINAL [{}] (Depth: {}) 🐙",
-        pair, depth
+        pair, DEFAULT_ORDERBOOK_DEPTH
     );
     let title = Paragraph::new(title_text)
         .style(
@@ -517,7 +479,7 @@ fn render_header(f: &mut Frame, area: Rect, pair: &str, depth: usize) {
     f.render_widget(title, area);
 }
 
-fn render_order_book(f: &mut Frame, area: Rect, state: &AppState, pair: &str, depth: usize) {
+fn render_order_book(f: &mut Frame, area: Rect, state: &AppState, pair: &str) {
     let mut rows = Vec::new();
     rows.push(
         Row::new(vec!["Side", "Price", "Qty"])
@@ -527,7 +489,7 @@ fn render_order_book(f: &mut Frame, area: Rect, state: &AppState, pair: &str, de
     let book_to_render = state.frozen_view.as_ref().or_else(|| state.books.get(pair));
 
     if let Some(book) = book_to_render {
-        for (_price, (p_str, q_str)) in book.asks.iter().take(depth) {
+        for (_price, (p_str, q_str)) in book.asks.iter().take(DEFAULT_ORDERBOOK_DEPTH) {
             rows.push(Row::new(vec![
                 Cell::from("ASK").style(Style::default().fg(Color::Red)),
                 Cell::from(p_str.as_str()),
@@ -537,7 +499,7 @@ fn render_order_book(f: &mut Frame, area: Rect, state: &AppState, pair: &str, de
 
         rows.push(Row::new(vec!["---", "---", "---"]));
 
-        for (_price, (p_str, q_str)) in book.bids.iter().rev().take(depth) {
+        for (_price, (p_str, q_str)) in book.bids.iter().rev().take(DEFAULT_ORDERBOOK_DEPTH) {
             rows.push(Row::new(vec![
                 Cell::from("BID").style(Style::default().fg(Color::Green)),
                 Cell::from(p_str.as_str()),
