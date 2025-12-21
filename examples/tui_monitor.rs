@@ -4,6 +4,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use forge_sdk::KrakenClient;
+use forge_sdk::book::checksum::validate_checksum;
 use forge_sdk::book::orderbook::LocalBook;
 use forge_sdk::model::message::{BookData, BookLevel, BookMessage, KrakenMessage};
 use memchr::memmem;
@@ -32,6 +33,10 @@ const MAX_LOG_ENTRIES: usize = 50;
 const UI_POLL_INTERVAL_MS: u64 = 50;
 const WHALE_ALERT_THRESHOLD: f64 = 50_000.0;
 const MEDIUM_TRADE_THRESHOLD: f64 = 10_000.0;
+
+// --- CHECKSUM VALIDATION CONSTANTS ---
+const CHECKSUM_GRACE_PERIOD_SECS: u64 = 3; // Skip validation for 3s after snapshot
+const MAX_CHECKSUM_FAILURES: u32 = 3; // Failures before triggering recovery
 
 /// Manually parse book message using pre-compiled static regexes (O(1) compilation)
 fn manually_parse_book_message(json: &str) -> Result<KrakenMessage, serde_json::Error> {
@@ -126,8 +131,39 @@ enum SyncStatus {
     NetworkLost,
 }
 
+/// Per-pair synchronization state for robust checksum validation
+struct BookState {
+    pub book: LocalBook,
+    /// When we last received a snapshot (for grace period)
+    pub last_snapshot: Option<Instant>,
+    /// Number of consecutive checksum failures
+    pub checksum_failures: u32,
+    /// Is this pair currently recovering?
+    pub recovering: bool,
+}
+
+impl BookState {
+    fn new() -> Self {
+        Self {
+            book: LocalBook::new(),
+            last_snapshot: None,
+            checksum_failures: 0,
+            recovering: false,
+        }
+    }
+
+    /// Check if we're within the grace period after a snapshot
+    fn in_grace_period(&self) -> bool {
+        if let Some(snapshot_time) = self.last_snapshot {
+            snapshot_time.elapsed().as_secs() < CHECKSUM_GRACE_PERIOD_SECS
+        } else {
+            true // No snapshot yet, treat as grace period
+        }
+    }
+}
+
 struct AppState {
-    pub books: HashMap<String, LocalBook>,
+    pub books: HashMap<String, BookState>,
     pub logs: Vec<String>,
     pub status: SyncStatus,
     pub last_checksum: u32,
@@ -135,6 +171,8 @@ struct AppState {
     pub pairs: Vec<String>,
     pub frozen_view: Option<LocalBook>,
     pub metrics: Metrics,
+    /// Which pair is currently recovering (for display)
+    pub recovering_pair: Option<String>,
 }
 
 struct Metrics {
@@ -144,8 +182,7 @@ struct Metrics {
     pub last_second_count: u64,
     pub last_tick: Instant,
     pub processing_latency: Duration,
-    pub last_message_time: Instant, // Track when last message received
-    pub recovery_started: Option<Instant>, // Track when recovery started
+    pub last_message_time: Instant,
 }
 
 impl Metrics {
@@ -159,7 +196,6 @@ impl Metrics {
             last_tick: now,
             processing_latency: Duration::from_micros(0),
             last_message_time: now,
-            recovery_started: None,
         }
     }
 }
@@ -175,7 +211,24 @@ impl AppState {
             pairs: TRADING_PAIRS.iter().map(|s| s.to_string()).collect(),
             frozen_view: None,
             metrics: Metrics::new(),
+            recovering_pair: None,
         }
+    }
+
+    /// Calculate overall status based on per-pair states
+    fn calculate_status(&mut self) {
+        // Check if any pair is recovering
+        for (pair, state) in &self.books {
+            if state.recovering {
+                self.status = SyncStatus::Recovering;
+                self.recovering_pair = Some(pair.clone());
+                return;
+            }
+        }
+
+        // All pairs healthy
+        self.status = SyncStatus::Healthy;
+        self.recovering_pair = None;
     }
 
     fn log(&mut self, msg: String) {
@@ -214,6 +267,23 @@ async fn subscribe_to_channels(client: &mut KrakenClient) {
         let _ = client.send_raw(trade_cmd).await;
         let _ = client.send_raw(ohlc_cmd).await;
     }
+}
+
+/// Re-subscribe to a single pair's book feed (for recovery)
+async fn resubscribe_pair(client: &mut KrakenClient, pair: &str) {
+    // Unsubscribe first
+    let unsub_cmd = format!(
+        r#"{{"method":"unsubscribe", "params":{{"channel":"book", "symbol":["{}"]}}}}"#,
+        pair
+    );
+    let _ = client.send_raw(unsub_cmd).await;
+
+    // Small delay to ensure unsubscribe processes
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Re-subscribe to get fresh snapshot
+    let sub_cmd = build_subscription_command("book", pair, Some(DEFAULT_ORDERBOOK_DEPTH));
+    let _ = client.send_raw(sub_cmd).await;
 }
 
 // --- MAIN ENTRY ---
@@ -288,6 +358,8 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                 };
 
                 if let Ok(parsed) = parsed {
+                    let mut pair_to_recover: Option<String> = None;
+
                     {
                         let mut s = state.lock().unwrap();
 
@@ -299,12 +371,6 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                         if s.status == SyncStatus::NetworkLost {
                             s.status = SyncStatus::Healthy;
                             s.log("✅ Network connection restored!".to_string());
-                        }
-
-                        // Auto-recover from Recovering state when we receive messages
-                        if s.status == SyncStatus::Recovering {
-                            s.status = SyncStatus::Healthy;
-                            s.metrics.recovery_started = None;
                         }
 
                         // 🚀 CALCULATE MESSAGES PER SECOND (MPS)
@@ -320,7 +386,7 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                         // Process message types
                         match parsed {
                             KrakenMessage::Book(msg) => {
-                                handle_book_message(&mut s, msg);
+                                pair_to_recover = handle_book_message(&mut s, msg);
                             }
                             KrakenMessage::Trade(msg) => {
                                 handle_trade_message(&mut s, msg);
@@ -334,6 +400,11 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
                         let elapsed = start_process.elapsed();
                         s.metrics.processing_latency = elapsed;
                     }
+
+                    // Handle per-pair recovery OUTSIDE the lock
+                    if let Some(pair) = pair_to_recover {
+                        resubscribe_pair(&mut client, &pair).await;
+                    }
                 }
             }
             Err(_e) => {
@@ -346,31 +417,77 @@ async fn run_network_loop(state: Arc<Mutex<AppState>>) {
     }
 }
 
-/// Handle book message updates - simplified, no checksum validation
-fn handle_book_message(state: &mut AppState, msg: BookMessage) {
+/// Handle book message updates with per-pair checksum validation
+fn handle_book_message(state: &mut AppState, msg: BookMessage) -> Option<String> {
     let data = &msg.data[0];
-    let sym = &data.symbol;
+    let sym = data.symbol.clone();
 
+    // Ensure BookState exists for this pair
     state
         .books
         .entry(sym.clone())
-        .or_insert_with(LocalBook::new);
+        .or_insert_with(BookState::new);
+
+    let mut pair_to_recover: Option<String> = None;
+    let mut log_msg: Option<String> = None;
 
     if msg.r#type == "snapshot" {
-        if let Some(book) = state.books.get_mut(sym) {
-            book.apply_snapshot(data.bids.clone(), data.asks.clone());
-            state.log(format!("📸 Snapshot Loaded for {}", sym));
+        // Handle snapshot - reset sync state for this pair
+        if let Some(book_state) = state.books.get_mut(&sym) {
+            book_state
+                .book
+                .apply_snapshot(data.bids.clone(), data.asks.clone());
+            book_state.last_snapshot = Some(Instant::now());
+            book_state.checksum_failures = 0;
+            book_state.recovering = false;
+            log_msg = Some(format!("📸 Snapshot Loaded for {}", sym));
         }
     } else {
-        // Apply delta updates
-        if let Some(book) = state.books.get_mut(sym) {
-            book.apply_updates(data.bids.clone(), true);
-            book.apply_updates(data.asks.clone(), false);
+        // Handle delta update
+        if let Some(book_state) = state.books.get_mut(&sym) {
+            // Always apply updates
+            book_state.book.apply_updates(data.bids.clone(), true);
+            book_state.book.apply_updates(data.asks.clone(), false);
+
+            // Only validate checksum if:
+            // 1. Not in grace period (have snapshot and it's been > 3 seconds)
+            // 2. Not currently recovering
+            if !book_state.in_grace_period() && !book_state.recovering {
+                let is_valid = validate_checksum(&book_state.book, data.checksum);
+
+                if !is_valid {
+                    book_state.checksum_failures += 1;
+
+                    if book_state.checksum_failures >= MAX_CHECKSUM_FAILURES {
+                        // Too many failures - trigger recovery for THIS pair only
+                        log_msg = Some(format!(
+                            "❌ {} checksum failures for {} - recovering...",
+                            book_state.checksum_failures, sym
+                        ));
+                        book_state.recovering = true;
+                        book_state.book = LocalBook::new();
+                        pair_to_recover = Some(sym.clone());
+                    }
+                } else {
+                    // Checksum valid - reset failure count
+                    book_state.checksum_failures = 0;
+                }
+            }
         }
     }
 
-    // Store last checksum for display purposes only (not validated)
+    // Log message AFTER releasing the mutable borrow
+    if let Some(msg) = log_msg {
+        state.log(msg);
+    }
+
+    // Store last checksum for display
     state.last_checksum = data.checksum;
+
+    // Update overall status
+    state.calculate_status();
+
+    pair_to_recover
 }
 
 /// Handle trade messages with whale detection
@@ -422,8 +539,8 @@ fn run_ui_loop(
                             s.frozen_view = None;
                         } else {
                             let current_pair = &s.pairs[s.curr_index];
-                            if let Some(live_book) = s.books.get(current_pair) {
-                                s.frozen_view = Some(live_book.clone());
+                            if let Some(book_state) = s.books.get(current_pair) {
+                                s.frozen_view = Some(book_state.book.clone());
                             }
                         }
                     }
@@ -486,7 +603,11 @@ fn render_order_book(f: &mut Frame, area: Rect, state: &AppState, pair: &str) {
             .style(Style::default().add_modifier(Modifier::UNDERLINED)),
     );
 
-    let book_to_render = state.frozen_view.as_ref().or_else(|| state.books.get(pair));
+    // Get the book to render - either frozen view or live from BookState
+    let book_to_render: Option<&LocalBook> = state
+        .frozen_view
+        .as_ref()
+        .or_else(|| state.books.get(pair).map(|bs| &bs.book));
 
     if let Some(book) = book_to_render {
         for (_price, (p_str, q_str)) in book.asks.iter().take(DEFAULT_ORDERBOOK_DEPTH) {
