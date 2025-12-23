@@ -1,5 +1,7 @@
 use crate::error::KrakenError;
+use crate::governor::{Governor, GovernorConfig, OperationalMode};
 use crate::network::connection::ConnectionManager;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub struct KrakenClient {
@@ -14,6 +16,9 @@ pub struct KrakenClient {
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub token: Option<String>,
+
+    // Resource-Aware Governor (optional)
+    governor: Option<Arc<Governor>>,
 }
 
 impl KrakenClient {
@@ -36,7 +41,73 @@ impl KrakenClient {
             api_key: None,
             api_secret: None,
             token: None,
+            governor: None,
         })
+    }
+
+    /// Connects to Kraken Websocket API with Resource-Aware Governor.
+    ///
+    /// The Governor monitors CPU/RAM and automatically throttles SDK activity
+    /// during high-load periods to protect your trading algorithm.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use forge_sdk::{KrakenClient, GovernorConfig};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     // Default config: throttle at 60% CPU, shed load at 90%
+    ///     let client = KrakenClient::connect_with_governor(
+    ///         "wss://ws.kraken.com/v2",
+    ///         GovernorConfig::default(),
+    ///     ).await.unwrap();
+    ///
+    ///     // Access governor for monitoring
+    ///     if let Some(gov) = client.governor() {
+    ///         println!("Mode: {}", gov.current_mode());
+    ///     }
+    /// }
+    /// ```
+    pub async fn connect_with_governor(
+        url: &str,
+        config: GovernorConfig,
+    ) -> Result<Self, KrakenError> {
+        let (tx_user_cmd, rx_engine_cmd) = mpsc::channel(32);
+        let (tx_engine_event, rx_user_event) = mpsc::channel(100);
+
+        // Start the Governor monitoring thread
+        let governor = Governor::start(config);
+
+        // Spawn the Engine with Governor
+        let manager =
+            ConnectionManager::with_governor(url, tx_engine_event, rx_engine_cmd, Arc::clone(&governor))
+                .map_err(|e| KrakenError::ConnectionError(e.to_string()))?;
+
+        tokio::spawn(manager.run());
+
+        Ok(Self {
+            command_sender: tx_user_cmd,
+            event_receiver: Some(rx_user_event),
+            api_key: None,
+            api_secret: None,
+            token: None,
+            governor: Some(governor),
+        })
+    }
+
+    /// Get the Governor if enabled.
+    pub fn governor(&self) -> Option<&Arc<Governor>> {
+        self.governor.as_ref()
+    }
+
+    /// Get the current operational mode (Performance/Balanced/Survival).
+    ///
+    /// Returns Performance if Governor is not enabled.
+    pub fn operational_mode(&self) -> OperationalMode {
+        self.governor
+            .as_ref()
+            .map(|g| g.current_mode())
+            .unwrap_or(OperationalMode::Performance)
     }
 
     /// Login with API credentials (for authenticated feeds)

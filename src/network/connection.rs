@@ -5,7 +5,9 @@
 
 use crate::conflation::{ConflationManager, ConflationState};
 use crate::error::KrakenError;
+use crate::governor::Governor;
 use futures::{SinkExt, StreamExt};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval, sleep};
@@ -31,6 +33,9 @@ const FLUSH_INTERVAL_MS: u64 = 10;
 /// - Passthrough in Green state (< 50% channel usage)
 /// - Smart batching in Yellow state (50-90% usage)
 /// - Aggressive conflation in Red state (> 90% usage)
+///
+/// Additionally, the Resource-Aware Governor monitors CPU/RAM and can
+/// trigger Survival mode to shed non-critical messages during system stress.
 pub struct ConnectionManager {
     url: Url,
     event_sender: mpsc::Sender<Result<String, KrakenError>>,
@@ -38,6 +43,8 @@ pub struct ConnectionManager {
     active_subscriptions: Vec<String>,
     /// The adaptive conflation manager
     conflation: ConflationManager,
+    /// Resource-Aware Governor for CPU/RAM monitoring
+    governor: Option<Arc<Governor>>,
 }
 
 impl ConnectionManager {
@@ -58,6 +65,30 @@ impl ConnectionManager {
             command_receiver,
             active_subscriptions: Vec::new(),
             conflation: ConflationManager::new(),
+            governor: None,
+        })
+    }
+
+    /// Create a new ConnectionManager with a Governor.
+    ///
+    /// # Arguments
+    /// * `url` - WebSocket URL to connect to
+    /// * `event_sender` - Channel to send events to the client
+    /// * `command_receiver` - Channel to receive commands from the client
+    /// * `governor` - Resource-Aware Governor for system monitoring
+    pub fn with_governor(
+        url: &str,
+        event_sender: mpsc::Sender<Result<String, KrakenError>>,
+        command_receiver: mpsc::Receiver<String>,
+        governor: Arc<Governor>,
+    ) -> Result<Self, KrakenError> {
+        Ok(Self {
+            url: Url::parse(url)?,
+            event_sender,
+            command_receiver,
+            active_subscriptions: Vec::new(),
+            conflation: ConflationManager::new(),
+            governor: Some(governor),
         })
     }
 
@@ -86,7 +117,22 @@ impl ConnectionManager {
     /// This is the core of the Adaptive Conflation Engine:
     /// - In Green state: immediate passthrough
     /// - In Yellow/Red state: buffer for conflation
+    ///
+    /// Additionally, the Resource-Aware Governor can trigger Survival mode
+    /// to drop non-critical messages when CPU/RAM is under pressure.
     async fn send_with_conflation(&mut self, text: &str) -> Result<(), ()> {
+        // FAST PATH: Governor-based load shedding (nanosecond check)
+        if let Some(ref governor) = self.governor {
+            if governor.is_survival() {
+                // In Survival mode: skip non-critical messages entirely
+                // This is the cheapest possible check - no JSON parsing
+                if self.is_droppable_message(text) {
+                    trace!("Governor Survival: dropping non-critical message");
+                    return Ok(());
+                }
+            }
+        }
+
         // Update state based on current channel pressure
         self.update_conflation_state();
 
@@ -118,6 +164,26 @@ impl ConnectionManager {
         }
 
         Ok(())
+    }
+
+    /// Check if a message can be dropped in Survival mode.
+    ///
+    /// # Performance
+    /// Uses cheap string contains checks instead of JSON parsing.
+    /// This runs in the hot path so must be extremely fast.
+    #[inline]
+    fn is_droppable_message(&self, text: &str) -> bool {
+        // Heartbeats are always droppable
+        if text.contains("\"heartbeat\"") {
+            return true;
+        }
+        // System status messages are droppable
+        if text.contains("\"status\"") && !text.contains("\"error\"") {
+            return true;
+        }
+        // Subscription confirmations during survival can be deferred
+        // but we keep them for now as they're rare
+        false
     }
 
     /// The main event loop - runs forever until the app closes.
