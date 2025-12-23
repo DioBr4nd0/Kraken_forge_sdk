@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// The Resource-Aware Governor.
 ///
