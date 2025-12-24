@@ -31,12 +31,12 @@ The SDK supports both **public market data feeds** (order books, trades, tickers
 ### TUI Terminal Monitor
 A full-featured terminal dashboard showing live order book, trade events, whale alerts, and real-time performance metrics:
 
-![TUI Terminal Monitor](terminal.png)
+![TUI Terminal Monitor](./examples/static/terminal.png)
 
 ### Live Candlestick Chart
 Browser-based candlestick chart with historical data loading and real-time WebSocket updates:
 
-![Candlestick Chart](candlestick.png)
+![Candlestick Chart](./examples/static/candlestick.png)
 
 ---
 

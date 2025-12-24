@@ -38,6 +38,7 @@ memchr = "2"
 once_cell = "1"
 ordered-float = "4"
 thiserror = "2"
+dotenvy = "0.15"
 
 # System info
 sysinfo = "0.32"
@@ -84,3 +85,7 @@ path = "examples/ticker_parser.rs"
 [[example]]
 name = "tui_monitor"
 path = "examples/tui_monitor.rs"
+
+[[example]]
+name = "auth_test"
+path = "examples/auth_test.rs"

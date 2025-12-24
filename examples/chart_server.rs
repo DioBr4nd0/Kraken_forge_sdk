@@ -27,30 +27,16 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
-
-/// Server configuration - all values can be overridden via environment variables
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Server bind host
     pub host: String,
-    /// Server port
     pub port: u16,
-    /// Kraken WebSocket URL
     pub kraken_ws_url: String,
-    /// Kraken REST API base URL
     pub kraken_rest_url: String,
-    /// Trading pairs to subscribe to
     pub trading_pairs: Vec<String>,
-    /// OHLC intervals to subscribe to (in minutes)
     pub intervals: Vec<i32>,
-    /// Default interval for API queries
     pub default_interval: i32,
-    /// Broadcast channel capacity
     pub broadcast_capacity: usize,
-    /// Reconnect delay in seconds
     pub reconnect_delay_secs: u64,
 }
 
@@ -75,7 +61,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load configuration from environment variables with defaults
+    /// Load configuration
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
@@ -100,30 +86,21 @@ impl Config {
         config
     }
 
-    /// Get the full server bind address
+    /// Get server bind address
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
 
-    /// Get the OHLC REST endpoint URL
+    /// Get OHLC REST endpoint URL
     pub fn ohlc_url(&self) -> String {
         format!("{}/OHLC", self.kraken_rest_url)
     }
 }
-
-// ============================================================================
-// APPLICATION STATE
-// ============================================================================
-
 #[derive(Clone)]
 struct AppState {
     tx: broadcast::Sender<String>,
     config: Arc<Config>,
 }
-
-// ============================================================================
-// API TYPES
-// ============================================================================
 
 #[derive(Deserialize)]
 struct OhlcQuery {
@@ -140,18 +117,15 @@ struct OhlcCandle {
     close: f64,
 }
 
-// ============================================================================
-// MAIN ENTRY POINT
-// ============================================================================
 
 #[tokio::main]
 async fn main() {
-    // Initialize TLS crypto provider
+    // Initialize 
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
 
-    // Load configuration
+    
     let config = Arc::new(Config::from_env());
 
     println!("🚀 Starting Kraken Chart Server...");
@@ -190,10 +164,6 @@ async fn main() {
 
     axum::serve(listener, app).await.unwrap();
 }
-
-// ============================================================================
-// HTTP HANDLERS
-// ============================================================================
 
 /// Serve the HTML page
 async fn serve_html() -> Html<&'static str> {
@@ -290,10 +260,6 @@ fn parse_price(value: &serde_json::Value) -> f64 {
     value.as_str().unwrap_or("0").parse().unwrap_or(0.0)
 }
 
-// ============================================================================
-// WEBSOCKET HANDLERS
-// ============================================================================
-
 /// WebSocket upgrade handler
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
@@ -309,10 +275,6 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
         }
     }
 }
-
-// ============================================================================
-// KRAKEN WEBSOCKET CLIENT
-// ============================================================================
 
 /// Connect to Kraken WebSocket and broadcast OHLC updates
 async fn run_kraken_ws(tx: broadcast::Sender<String>, config: Arc<Config>) {
