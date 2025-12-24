@@ -15,8 +15,12 @@ pub struct GovernorConfig {
     pub sample_interval_ms: u64,
     /// Number of consecutive checks before mode transition (default: 2)
     pub hysteresis_threshold: u8,
-    /// Order book depth in Survival mode (default: 5, normal: 10)
+    /// Order book depth in Balanced mode (default: 100)
+    pub balanced_book_depth: usize,
+    /// Order book depth in Survival mode (default: 10)
     pub survival_book_depth: usize,
+    /// Enable message filtering in non-Performance modes (default: true)
+    pub enable_message_filtering: bool,
 }
 
 impl Default for GovernorConfig {
@@ -28,7 +32,9 @@ impl Default for GovernorConfig {
             survival_ram_threshold_mb: 512,
             sample_interval_ms: 500,
             hysteresis_threshold: 2,
-            survival_book_depth: 5,
+            balanced_book_depth: 100,
+            survival_book_depth: 10,
+            enable_message_filtering: true,
         }
     }
 }
@@ -110,6 +116,18 @@ impl GovernorConfigBuilder {
     /// Set the order book depth in Survival mode.
     pub fn survival_book_depth(mut self, depth: usize) -> Self {
         self.config.survival_book_depth = depth;
+        self
+    }
+
+    /// Set the order book depth in Balanced mode.
+    pub fn balanced_book_depth(mut self, depth: usize) -> Self {
+        self.config.balanced_book_depth = depth;
+        self
+    }
+
+    /// Enable or disable message filtering in non-Performance modes.
+    pub fn enable_message_filtering(mut self, enable: bool) -> Self {
+        self.config.enable_message_filtering = enable;
         self
     }
 
