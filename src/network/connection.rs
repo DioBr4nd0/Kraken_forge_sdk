@@ -1,7 +1,4 @@
-//! WebSocket connection management with adaptive conflation.
-//!
-//! This module handles the WebSocket connection to Kraken and implements
-//! the Adaptive Conflation Engine for backpressure handling.
+//! WebSocket connection manager with conflation and Governor support.
 
 use crate::conflation::{ConflationManager, ConflationState};
 use crate::error::KrakenError;
@@ -26,16 +23,7 @@ const CHANNEL_CAPACITY: usize = 100;
 /// Interval for flush checks when buffer has pending messages.
 const FLUSH_INTERVAL_MS: u64 = 10;
 
-/// Manages the WebSocket connection to Kraken with adaptive conflation.
-///
-/// The ConnectionManager implements the Adaptive Conflation Engine which
-/// automatically handles backpressure during high-traffic spikes by:
-/// - Passthrough in Green state (< 50% channel usage)
-/// - Smart batching in Yellow state (50-90% usage)
-/// - Aggressive conflation in Red state (> 90% usage)
-///
-/// Additionally, the Resource-Aware Governor monitors CPU/RAM and can
-/// trigger Survival mode to shed non-critical messages during system stress.
+/// Manages WebSocket connection with conflation support.
 pub struct ConnectionManager {
     url: Url,
     event_sender: mpsc::Sender<Result<String, KrakenError>>,
@@ -49,11 +37,6 @@ pub struct ConnectionManager {
 
 impl ConnectionManager {
     /// Create a new ConnectionManager.
-    ///
-    /// # Arguments
-    /// * `url` - WebSocket URL to connect to
-    /// * `event_sender` - Channel to send events to the client
-    /// * `command_receiver` - Channel to receive commands from the client
     pub fn new(
         url: &str,
         event_sender: mpsc::Sender<Result<String, KrakenError>>,

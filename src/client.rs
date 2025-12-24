@@ -45,29 +45,7 @@ impl KrakenClient {
         })
     }
 
-    /// Connects to Kraken Websocket API with Resource-Aware Governor.
-    ///
-    /// The Governor monitors CPU/RAM and automatically throttles SDK activity
-    /// during high-load periods to protect your trading algorithm.
-    ///
-    /// # Example
-    /// ```no_run
-    /// use forge_sdk::{KrakenClient, GovernorConfig};
-    ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///     // Default config: throttle at 60% CPU, shed load at 90%
-    ///     let client = KrakenClient::connect_with_governor(
-    ///         "wss://ws.kraken.com/v2",
-    ///         GovernorConfig::default(),
-    ///     ).await.unwrap();
-    ///
-    ///     // Access governor for monitoring
-    ///     if let Some(gov) = client.governor() {
-    ///         println!("Mode: {}", gov.current_mode());
-    ///     }
-    /// }
-    /// ```
+    /// Connect to Kraken WS with Governor for resource monitoring.
     pub async fn connect_with_governor(
         url: &str,
         config: GovernorConfig,
@@ -124,17 +102,7 @@ impl KrakenClient {
         Ok(())
     }
 
-    /// Place a new order (requires authentication)
-    ///
-    /// # Arguments
-    /// * `symbol` - Trading pair (e.g., "BTC/USD")
-    /// * `side` - "buy" or "sell"
-    /// * `order_type` - "limit" or "market"
-    /// * `quantity` - Order quantity
-    /// * `price` - Limit price (optional for market orders)
-    ///
-    /// # Safety
-    /// This method places real orders. Use with caution and test with small amounts first.
+    /// Place a new order (requires auth). Use with caution.
     pub async fn add_order(
         &self,
         symbol: &str,
@@ -167,13 +135,7 @@ impl KrakenClient {
         self.send_command(params.to_string()).await
     }
 
-    /// Cancel one or more orders (requires authentication)
-    ///
-    /// # Arguments
-    /// * `order_ids` - List of order IDs to cancel
-    ///
-    /// # Safety
-    /// This method cancels real orders. Ensure you're canceling the correct orders.
+    /// Cancel orders (requires auth).
     pub async fn cancel_order(&self, order_ids: &[&str]) -> Result<(), KrakenError> {
         let token = self.token.as_ref().ok_or_else(|| {
             KrakenError::AuthError("Not authenticated. Call login() first.".to_string())

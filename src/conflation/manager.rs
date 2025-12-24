@@ -1,9 +1,4 @@
-//! The ConflationManager orchestrates adaptive backpressure handling.
-//!
-//! It sits between the WebSocket reader and the output channel, providing:
-//! - Fast-path passthrough in Green state
-//! - Smart batching in Yellow state  
-//! - Aggressive conflation in Red state
+//! Conflation manager for adaptive backpressure handling.
 
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
@@ -94,17 +89,15 @@ impl ConflationManager {
         if self.config.log_transitions && self.state != self.prev_state {
             match self.state {
                 ConflationState::Green => {
-                    debug!("Conflation state: GREEN (passthrough mode)");
+                    debug!("State: GREEN");
                 }
                 ConflationState::Yellow => {
-                    warn!(
-                        "Conflation state: YELLOW (batching mode) - channel at {}%",
+                    warn!("State: YELLOW ({}% full)",
                         (current_len as f64 / max_capacity as f64 * 100.0) as u32
                     );
                 }
                 ConflationState::Red => {
-                    warn!(
-                        "Conflation state: RED (aggressive conflation) - channel at {}%",
+                    warn!("State: RED ({}% full)",
                         (current_len as f64 / max_capacity as f64 * 100.0) as u32
                     );
                 }

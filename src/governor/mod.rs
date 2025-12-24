@@ -1,18 +1,4 @@
-//! Resource-Aware Governor for adaptive system load management.
-//!
-//! This module monitors system resources (CPU, RAM) and dynamically adjusts
-//! SDK behavior to protect the user's trading algorithm during high-load periods.
-//!
-//! # Architecture
-//!
-//! - **Metrics**: Background telemetry collecting CPU/RAM every 500ms
-//! - **Policy**: State machine with hysteresis (Performance/Balanced/Survival)
-//! - **Actuators**: Integration points in ConnectionManager and LocalBook
-//!
-//! # Performance
-//!
-//! Mode checks use `AtomicU8::load(Relaxed)` for **nanosecond** access in hot paths.
-//! The monitoring thread is completely separate and never blocks the WebSocket loop.
+//! Resource-Aware Governor - monitors CPU/RAM and throttles SDK activity.
 
 mod config;
 mod metrics;
@@ -28,10 +14,7 @@ use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 use tracing::{info, warn};
 
-/// The Resource-Aware Governor.
-///
-/// Monitors system resources and provides a lock-free operational mode
-/// that can be checked in nanoseconds from hot paths.
+/// The Governor monitors system resources and sets operational mode.
 pub struct Governor {
     /// Atomic mode for lock-free access (0=Performance, 1=Balanced, 2=Survival)
     mode: AtomicU8,
@@ -66,11 +49,7 @@ impl Governor {
         }
     }
 
-    /// Get the current operational mode.
-    ///
-    /// # Performance
-    /// This uses `Relaxed` ordering for maximum speed (~1 nanosecond).
-    /// Safe for our use case where eventual consistency is acceptable.
+    /// Get current mode. Uses relaxed atomic for speed.
     #[inline]
     pub fn current_mode(&self) -> OperationalMode {
         OperationalMode::from_u8(self.mode.load(Ordering::Relaxed))
@@ -216,22 +195,13 @@ impl Governor {
     fn log_transition(&self, old: OperationalMode, new: OperationalMode, metrics: &HealthMetrics) {
         match new {
             OperationalMode::Performance => {
-                info!(
-                    "Governor: {} -> {} (CPU: {:.1}%, RAM: {}MB free)",
-                    old, new, metrics.cpu_usage_percent, metrics.available_ram_mb
-                );
+                info!("{} -> {} (CPU {:.0}%)", old, new, metrics.cpu_usage_percent);
             }
             OperationalMode::Balanced => {
-                warn!(
-                    "Governor: {} -> {} (CPU: {:.1}%, RAM: {}MB free) - Enabling smart batching",
-                    old, new, metrics.cpu_usage_percent, metrics.available_ram_mb
-                );
+                warn!("{} -> {} (CPU {:.0}%)", old, new, metrics.cpu_usage_percent);
             }
             OperationalMode::Survival => {
-                warn!(
-                    "Governor: {} -> {} (CPU: {:.1}%, RAM: {}MB free) - LOAD SHEDDING ACTIVE",
-                    old, new, metrics.cpu_usage_percent, metrics.available_ram_mb
-                );
+                warn!("{} -> {} (CPU {:.0}%) SHEDDING", old, new, metrics.cpu_usage_percent);
             }
         }
     }
